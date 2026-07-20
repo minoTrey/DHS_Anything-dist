@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DHS Anything Chrome Diagnostic",
-  "version": "0.1.295",
+  "version": "0.1.296",
   "description": "Redacted diagnostics for Naver Real Estate listing context.",
   "permissions": [
     "alarms",

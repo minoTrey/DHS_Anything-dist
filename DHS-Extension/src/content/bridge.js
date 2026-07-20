@@ -580,6 +580,7 @@
   let lastClickedListingRoot = null;
   let lastClickedListingAt = 0;
   let lastClickedListingText = '';
+  let lastClickedListingSource = '';
   let selectedArticleMarkerSource = '';
   let representativeChildSelectionKey = '';
   let representativeChildSelectionAt = 0;
@@ -1380,6 +1381,7 @@
     lastClickedListingRoot = root;
     lastClickedListingAt = Date.now();
     lastClickedListingText = listingTextForSelectionRoot(root);
+    lastClickedListingSource = 'user';
   }
 
   function rememberClickedListingRoot(element) {
@@ -1578,6 +1580,7 @@
     lastClickedListingRoot = candidate.root;
     lastClickedListingAt = Date.now();
     lastClickedListingText = listingTextForSelectionRoot(candidate.root);
+    lastClickedListingSource = 'auto';
     selectedArticleMarkerSource = 'representative-child';
     return Boolean(lastClickedListingText || articleNoFromListingRoot(candidate.root));
   }
@@ -1585,6 +1588,10 @@
   function maybeAutoSelectRepresentativeChild() {
     const candidate = representativeChildSelectionCandidate();
     if (!candidate) return;
+    // A fresh, explicit user click on a different listing wins over auto-selecting the group's
+    // representative child (otherwise clicking 101동 gets clobbered back to the representative).
+    const userClickedRoot = recentClickedListingRoot();
+    if (userClickedRoot && userClickedRoot !== candidate.root && lastClickedListingSource === 'user') return;
     const now = Date.now();
     if (candidate.key === representativeChildSelectionKey && (now - representativeChildSelectionAt) < 60000) return;
     representativeChildSelectionKey = candidate.key;
@@ -10762,21 +10769,9 @@
     maybeAutoSelectRepresentativeChild();
     const selectedArticleMarker = articleMarkerFromSelectedListing();
     const representativeChildContext = representativeChildContextActive();
-    if (urlArticleMarker && lastArticleMarker && urlArticleMarker !== lastArticleMarker) {
-      resetProviderCandidate('idle', 'article-changed');
-      resetDirectLookupStatus('idle');
-      resetProviderFloorHint('article-changed');
-      resetProviderEvidenceTemp();
-      state.cpProviderAttemptIndex = 0;
-      state.cpProviderAttemptCount = 0;
-      state.cpProviderCurrentFamily = '';
-      resetResolverEvidence();
-      resetCdpResolverFinal('article-changed');
-      resetAutoLoop('article-changed');
-      resetExactEvidenceReceiptKeys();
-      clearConfirmedExactLatch('article-changed');
-      clearProviderCandidate(lastArticleMarker);
-    }
+    // The article-changed reset is applied below, keyed off the RESOLVED article marker
+    // (not the complex/URL marker) so it fires only on a real listing change — not every
+    // tick when a listing legitimately resolves to a child marker differing from the URL.
     if (urlArticleMarker) lastArticleMarker = urlArticleMarker;
     const officialTabPresent = Array.from(document.querySelectorAll('button, a')).some(
       (element) => normalizeText(element.innerText || element.textContent) === DETAIL_TAB_TEXT
@@ -10815,7 +10810,21 @@
       articleContext.articleMarker
       && previousScanArticleMarker
       && articleContext.articleMarker !== previousScanArticleMarker
-    ) resetExactEvidenceReceiptKeys();
+    ) {
+      resetProviderCandidate('idle', 'article-changed');
+      resetDirectLookupStatus('idle');
+      resetProviderFloorHint('article-changed');
+      resetProviderEvidenceTemp();
+      state.cpProviderAttemptIndex = 0;
+      state.cpProviderAttemptCount = 0;
+      state.cpProviderCurrentFamily = '';
+      resetResolverEvidence();
+      resetCdpResolverFinal('article-changed');
+      resetAutoLoop('article-changed');
+      resetExactEvidenceReceiptKeys();
+      clearConfirmedExactLatch('article-changed');
+      clearProviderCandidate(previousScanArticleMarker);
+    }
 
     const activeDetailFloor = enrichDetailFloorWithArticleContext(detailFloor);
 

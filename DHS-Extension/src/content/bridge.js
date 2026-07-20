@@ -2674,6 +2674,58 @@
     });
   }
 
+  function pickCurrentRegionOptionFromOverlay(optionText) {
+    const text = normalizeText(optionText);
+    if (!text) return false;
+    if (!['selecting-region', 'confirming-region'].includes(state.regionExportStatus)) return false;
+    state.regionExportStatus = 'selecting-region';
+    state.regionExportSelectionKey = '';
+    state.regionExportSelectionLabel = '';
+    state.regionExportSelectionProof = '';
+    state.regionExportSelectionError = '';
+    selectCurrentRegionSelectorOption(text)
+      .then((picked) => {
+        if (!picked && state.regionExportStatus === 'selecting-region') {
+          state.regionExportSelectionError = 'region-option-unavailable';
+        }
+        const chosen = currentRegionSelection();
+        state.regionExportSelectionLevel = REGION_EXPORT_SELECTION_LEVELS[
+          Math.min(chosen.values.length, REGION_EXPORT_SELECTION_LEVELS.length - 1)
+        ];
+        scheduleRegionSelectionUiRefresh(text);
+        renderOverlay();
+      })
+      .catch((error) => {
+        if (isRuntimeInvalidationError(error)) {
+          markRuntimeUnavailable(error);
+          return;
+        }
+        if (state.regionExportStatus === 'selecting-region') {
+          state.regionExportSelectionError = 'region-option-unavailable';
+          renderOverlay();
+        }
+      });
+    return true;
+  }
+
+  function ensureRegionConfirmingSelection() {
+    if (state.regionExportStatus !== 'selecting-region') return;
+    if (refreshRegionExportSelectionState()) {
+      renderOverlay();
+      return;
+    }
+    const selection = currentRegionSelection();
+    if (!selection.complete) return;
+    state.regionExportSelectionKey = selection.key;
+    state.regionExportSelectionLabel = selection.label;
+    state.regionExportSelectionProof = currentRegionComplexPopupMatchesKey(selection.key)
+      ? 'selector-complete'
+      : '';
+    state.regionExportSelectionError = '';
+    state.regionExportStatus = 'confirming-region';
+    renderOverlay();
+  }
+
   function beginRegionExportSelectionFromOverlay() {
     if (['preparing', 'running', 'saving'].includes(state.regionExportStatus)) return false;
     state.regionExportStatus = 'selecting-region';
@@ -2830,6 +2882,23 @@
     }
     if (currentIndex <= 0) return rows;
     return [rows[currentIndex], ...rows.slice(0, currentIndex), ...rows.slice(currentIndex + 1)];
+  }
+
+  function collectCurrentRegionLevelOptions() {
+    if (!currentRegionSelectorExpanded()) return [];
+    const seen = new Set();
+    const options = [];
+    Array.from(document.querySelectorAll('.filter_popup--area label.radio_label_district'))
+      .filter(isVisibleNode)
+      .forEach((node) => {
+        const text = normalizeText(currentRegionVisibleText(node));
+        if (!text) return;
+        const key = text.replace(/\s+/g, '').toLowerCase();
+        if (seen.has(key)) return;
+        seen.add(key);
+        options.push(text);
+      });
+    return options;
   }
 
   function collectCurrentRegionComplexOptions() {
@@ -4173,6 +4242,7 @@
   function regionExportSelectionErrorText(reason) {
     if (reason === 'selection-changed') return '\uC120\uD0DD\uD55C \uC9C0\uC5ED\uC774 \uBC14\uB00C\uC5C8\uC2B5\uB2C8\uB2E4. \uB2E4\uC2DC \uC120\uD0DD\uD574 \uC8FC\uC138\uC694.';
     if (reason === 'region-selector-occluded') return '\uC9C0\uC5ED \uC120\uD0DD \uCC3D\uC744 \uC5F4 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4.';
+    if (reason === 'region-option-unavailable') return '\uBAA9\uB85D\uC744 \uBD88\uB7EC\uC624\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4. \uB2E4\uC2DC \uC120\uD0DD\uD574 \uC8FC\uC138\uC694.';
     if (reason) return '\uC9C0\uC5ED \uC120\uD0DD \uCC3D\uC744 \uB2E4\uC2DC \uC5F4\uC5B4 \uC8FC\uC138\uC694.';
     return '\uC2DC/\uB3C4\uBD80\uD130 \uC74D/\uBA74/\uB3D9\uAE4C\uC9C0 \uC120\uD0DD\uD574 \uC8FC\uC138\uC694.';
   }
@@ -4202,6 +4272,9 @@
     const selection = state.regionExportStatus === 'confirming-region'
       ? confirmedSelection
       : liveSelection;
+    const readySelection = state.regionExportStatus === 'confirming-region' ? confirmedSelection : liveSelection;
+    const liveComplete = Boolean(readySelection && readySelection.complete);
+    flow.classList.toggle('is-confirming', liveComplete);
     const labels = ['\uC2DC/\uB3C4', '\uC2DC/\uAD70/\uAD6C', '\uC74D/\uBA74/\uB3D9'];
     const values = Array.isArray(selection.values) ? selection.values : [];
     Array.from(flow.querySelectorAll('.dhs-region-step')).forEach((node, index) => {
@@ -4213,26 +4286,37 @@
     });
     const title = flow.querySelector('.dhs-region-flow-title');
     const question = flow.querySelector('.dhs-region-question');
+    const optionsNode = flow.querySelector('.dhs-region-options');
     const choose = flow.querySelector('[data-dhs-action="choose-region"]');
     const confirm = flow.querySelector('[data-dhs-action="confirm-region"]');
     if (title) {
-      title.textContent = state.regionExportStatus === 'confirming-region'
-        ? '\uC120\uD0DD \uC9C0\uC5ED \uD655\uC778'
-        : '\uC9C0\uC5ED \uC120\uD0DD';
+      title.textContent = liveComplete ? '\uC120\uD0DD \uC9C0\uC5ED \uD655\uC778' : '\uC9C0\uC5ED \uC120\uD0DD';
     }
     if (question) {
-      question.textContent = state.regionExportStatus === 'confirming-region'
-        ? regionExportSelectionConfirmationText(confirmedSelection)
+      question.textContent = liveComplete
+        ? regionExportSelectionConfirmationText(readySelection)
         : regionExportSelectionErrorText(state.regionExportSelectionError);
+    }
+    if (optionsNode) {
+      const levelOptions = (!liveComplete && state.regionExportStatus === 'selecting-region')
+        ? collectCurrentRegionLevelOptions()
+        : [];
+      const activeLevelIndex = REGION_EXPORT_SELECTION_LEVELS.indexOf(normalizeRegionSelectionLevel(state.regionExportSelectionLevel));
+      const activeValue = normalizeText(values[activeLevelIndex] || '');
+      optionsNode.hidden = levelOptions.length === 0;
+      optionsNode.innerHTML = levelOptions.map((optionText) => {
+        const isActive = normalizeText(optionText) === activeValue;
+        return '<button type="button" class="dhs-region-option' + (isActive ? ' is-selected' : '') + '" role="option" aria-selected="' + (isActive ? 'true' : 'false') + '" data-dhs-action="pick-region-option" data-dhs-region-option="' + escapeHtml(optionText) + '">' + escapeHtml(optionText) + '</button>';
+      }).join('');
     }
     if (choose) {
       choose.textContent = '\uC9C0\uC5ED \uC120\uD0DD \uCC3D \uC5F4\uAE30';
-      choose.hidden = state.regionExportStatus !== 'selecting-region' || !state.regionExportSelectionError;
+      choose.hidden = liveComplete || !state.regionExportSelectionError;
     }
     if (confirm) {
-      confirm.textContent = '\uC774 \uC9C0\uC5ED \uC815\uBCF4 \uCD94\uCD9C';
-      confirm.hidden = state.regionExportStatus !== 'confirming-region';
-      confirm.disabled = !confirmedSelection.complete;
+      confirm.textContent = '\uCD94\uCD9C\uD558\uAE30';
+      confirm.hidden = !liveComplete;
+      confirm.disabled = !liveComplete;
     }
   }
 
@@ -6412,10 +6496,11 @@
       '<button type="button" class="dhs-region-step" data-dhs-action="choose-region-level" data-dhs-region-level="dong"><small>3</small><span class="dhs-region-step-value">\uC74D/\uBA74/\uB3D9</span></button>',
       '</div>',
       '<p class="dhs-region-question"></p>',
+      '<div class="dhs-region-options" role="listbox" aria-label="지역 목록" hidden></div>',
       '<div class="dhs-region-actions">',
       '<button type="button" class="dhs-region-choose" data-dhs-action="choose-region" hidden>\uC9C0\uC5ED \uC120\uD0DD \uCC3D \uC5F4\uAE30</button>',
       '<button type="button" class="dhs-region-cancel" data-dhs-action="cancel-region">\uCDE8\uC18C</button>',
-      '<button type="button" class="dhs-region-confirm" data-dhs-action="confirm-region" hidden>\uC774 \uC9C0\uC5ED \uC815\uBCF4 \uCD94\uCD9C</button>',
+      '<button type="button" class="dhs-region-confirm" data-dhs-action="confirm-region" hidden>\uCD94\uCD9C\uD558\uAE30</button>',
       '</div>',
       '</div>',
       '<button type="button" class="dhs-dev-toggle" data-dhs-action="toggle-dev">\uAC1C\uBC1C\uC790 \uC815\uBCF4</button>',
@@ -6447,7 +6532,12 @@
         requestCurrentRegionSelectorOpen(regionLevel);
         return;
       }
+      if (target.getAttribute('data-dhs-action') === 'pick-region-option') {
+        pickCurrentRegionOptionFromOverlay(target.getAttribute('data-dhs-region-option'));
+        return;
+      }
       if (target.getAttribute('data-dhs-action') === 'confirm-region') {
+        ensureRegionConfirmingSelection();
         confirmCurrentRegionExportFromOverlay();
         return;
       }

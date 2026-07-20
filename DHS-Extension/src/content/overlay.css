@@ -316,6 +316,48 @@
   line-height: 1.45;
 }
 
+#dhs-anything-diagnostic-overlay .dhs-region-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-height: 168px;
+  overflow-y: auto;
+  margin: 0 0 9px;
+  padding: 2px;
+}
+
+#dhs-anything-diagnostic-overlay .dhs-region-options[hidden] {
+  display: none;
+}
+
+#dhs-anything-diagnostic-overlay .dhs-region-option {
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  background: #fff;
+  color: #334155;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+#dhs-anything-diagnostic-overlay .dhs-region-option:hover {
+  border-color: #176b45;
+  color: #145c3a;
+}
+
+#dhs-anything-diagnostic-overlay .dhs-region-option.is-selected {
+  border-color: #145c3a;
+  background: #176b45;
+  color: #fff;
+}
+
+#dhs-anything-diagnostic-overlay .dhs-region-option:focus-visible {
+  outline: 2px solid #176b45;
+  outline-offset: 2px;
+}
+
 #dhs-anything-diagnostic-overlay .dhs-region-actions {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;

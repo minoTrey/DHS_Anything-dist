@@ -2285,7 +2285,7 @@
     if (typeof api.createSelection !== 'function') {
       return { sido: '', sigungu: '', eupMyeonDong: '', values: [], key: '', label: '', complete: false };
     }
-    const popupValues = Array.from(document.querySelectorAll('.filter_popup--area .area_select_item'))
+    const popupValues = Array.from(document.querySelectorAll('.filter_popup--area .area_select_item:not(.is-disabled)'))
       .filter(isVisibleNode)
       .map(currentRegionVisibleText)
       .map(normalizeText)
@@ -4263,17 +4263,20 @@
     if (!active) return;
     const api = regionExportSelectionApi();
     const popupSelection = currentRegionSelectorExpanded() ? currentRegionComplexPopupSelection() : null;
-    const liveSelection = popupSelection && popupSelection.values.length
-      ? popupSelection
-      : currentRegionSelection();
     const confirmedSelection = typeof api.createSelection === 'function'
       ? api.createSelection(String(state.regionExportSelectionKey || '').split('|'))
-      : liveSelection;
+      : (popupSelection || currentRegionSelection());
+    const popupComplete = Boolean(popupSelection && popupSelection.complete);
+    const complexListShown = currentRegionSelectorExpanded() && collectCurrentRegionComplexOptions().length > 0;
+    const liveComplete = state.regionExportStatus === 'confirming-region'
+      ? Boolean(confirmedSelection && confirmedSelection.complete)
+      : (popupComplete || complexListShown);
     const selection = state.regionExportStatus === 'confirming-region'
       ? confirmedSelection
-      : liveSelection;
-    const readySelection = state.regionExportStatus === 'confirming-region' ? confirmedSelection : liveSelection;
-    const liveComplete = Boolean(readySelection && readySelection.complete);
+      : (popupSelection || currentRegionSelection());
+    const readySelection = state.regionExportStatus === 'confirming-region'
+      ? confirmedSelection
+      : (popupComplete ? popupSelection : currentRegionSelection());
     flow.classList.toggle('is-confirming', liveComplete);
     const labels = ['\uC2DC/\uB3C4', '\uC2DC/\uAD70/\uAD6C', '\uC74D/\uBA74/\uB3D9'];
     const values = Array.isArray(selection.values) ? selection.values : [];

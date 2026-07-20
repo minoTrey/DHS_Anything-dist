@@ -505,6 +505,20 @@
       return buildLineInferenceView(state);
     }
 
+    if (state && state.groupedListingSelectionPending) {
+      return {
+        title: '동호수 확인',
+        statusLabel: '대기',
+        statusTone: 'idle',
+        primaryLabel: '현재 상태',
+        primaryValue: '매물 상세 펼치기',
+        helperText: '묶인 매물은 개별 물건을 눌러 상세를 펼치면 동·호수를 조사합니다.',
+        actionLabel: '매물 상세 펼치기',
+        summaryRows: [],
+        developerRows: buildDeveloperRows(state)
+      };
+    }
+
     if (providerOpenStatus === 'mismatch' || providerOpenStatus === 'unverified') {
       return {
         title: '\uB3D9\uD638\uC218 \uD655\uC778',

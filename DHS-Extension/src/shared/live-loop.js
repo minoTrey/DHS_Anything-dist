@@ -203,6 +203,7 @@
 
   function selectedListingActive(state) {
     const input = state || {};
+    if (input.groupedListingSelectionPending) return false;
     return Boolean(
       input.articlePresent ||
       input.articleMarker ||

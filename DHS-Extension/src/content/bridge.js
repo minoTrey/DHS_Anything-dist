@@ -1461,6 +1461,28 @@
       .some((root) => root && root.closest && root.closest('.item--child'));
   }
 
+  function isGroupedParentListingRoot(root) {
+    if (!root || (root.closest && root.closest('.item--child'))) return false;
+    const row = groupedListingSelectionRow(root);
+    return Boolean(row && row.isGroupedListing);
+  }
+
+  // A selection is "grouped context" when it stems from a grouped listing (a group
+  // parent, or a representative child of one). For these we defer dong-ho investigation
+  // until the listing's detail panel is actually expanded — never investigate the bare
+  // parent/group, which only yields ambiguous multi-unit results.
+  function selectedListingIsGroupedContext() {
+    const roots = selectedListingRoots({ preserveParent: true });
+    for (const root of roots) {
+      if (!root) continue;
+      const parent = (root.closest && root.closest('.item--child'))
+        ? childListingParentRoot(root)
+        : root;
+      if (isGroupedParentListingRoot(parent)) return true;
+    }
+    return false;
+  }
+
   function expandedListingRootKey(text) {
     return normalizeText(text).replace(/\s+/g, ' ').slice(0, 2000);
   }
@@ -7013,6 +7035,8 @@
       articleMarker: state.articleMarker || '',
       selectedArticleMarkerSource: state.selectedArticleMarkerSource || '',
       representativeChildContextPresent: Boolean(state.representativeChildContextPresent),
+      detailPanelPresent: Boolean(state.detailPanelPresent),
+      groupedListingSelectionPending: Boolean(state.groupedListingSelectionPending),
       selectedListingPresent: Boolean(state.articleMarker || state.articlePresent || state.detailContextPresent),
       detailScreenContextPresent: Boolean(state.detailScreenContextPresent),
       detailContextPresent: Boolean(state.detailContextPresent),
@@ -7453,6 +7477,7 @@
     });
     return {
       detailScreenContextPresent: Boolean(text),
+      detailPanelPresent: Boolean(detailPanelText),
       detailContextPresent: Boolean(text || cdpFallback.detailDongToken || cdpFallback.detailTypeToken || cdpFallback.detailFloorKind !== 'none'),
       detailFloorKind: floorSignal.floorKind !== 'none' ? floorSignal.floorKind : cdpFallback.detailFloorKind,
       detailFloorBand: floorSignal.floorBand || cdpFallback.detailFloorBand,
@@ -9973,6 +9998,7 @@
   }
 
   function selectedListingForRouteSearch() {
+    if (state.groupedListingSelectionPending) return false;
     return Boolean(
       state.articlePresent ||
       state.articleMarker ||
@@ -10915,6 +10941,19 @@
     state.articleMarker = articleContext.articleMarker;
     state.selectedArticleMarkerSource = selectedArticleMarkerSource || (representativeChildContext ? 'representative-child' : '');
     state.representativeChildContextPresent = Boolean(representativeChildContext || selectedArticleMarkerSource === 'representative-child');
+    const regionExportActiveForGate = ['preparing', 'running', 'saving'].includes(state.regionExportStatus);
+    // "Detail expanded" for gating must mean a REAL detail panel is open (text lifted from an
+    // actual detail panel), NOT a dong token / listing text from a selected representative-child
+    // list row. detailScreenContextPresent/detailContextPresent are both contaminated by the
+    // selected-listing fallback text, so gate on detailPanelPresent (Boolean(effectiveDetailPanelText)).
+    const listingDetailPanelExpanded = Boolean(detailFloor.detailPanelPresent);
+    state.detailPanelPresent = listingDetailPanelExpanded;
+    const groupedSelectionContext = representativeChildContext
+      || selectedArticleMarkerSource === 'representative-child'
+      || selectedListingIsGroupedContext();
+    state.groupedListingSelectionPending = !regionExportActiveForGate
+      && !listingDetailPanelExpanded
+      && groupedSelectionContext;
     state.officialTabPresent = officialTabPresent;
     state.detailScreenContextPresent = Boolean(activeDetailFloor.detailScreenContextPresent);
     state.detailContextPresent = detailContextPresent;

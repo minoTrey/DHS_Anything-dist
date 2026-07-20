@@ -2447,7 +2447,7 @@
   }
 
   async function clickCurrentRegionSelectorControl(target) {
-    const clicked = fallbackRegionExportClick(target);
+    const clicked = await dispatchRegionExportTrustedClick(target, 'region-export-selector-option');
     if (!clicked) return false;
     await delayMs(120);
     return true;
@@ -2525,25 +2525,24 @@
     if (selectorExpanded) state.regionExportSelectorWasExpanded = true;
     if (!state.regionExportSelectorReady) return false;
     const complexListReady = selectorExpanded && collectCurrentRegionComplexOptions().length > 0;
-    const popupSelection = complexListReady ? currentRegionComplexPopupSelection() : null;
-    const selection = popupSelection && popupSelection.complete ? popupSelection : currentRegionSelection();
+    if (!complexListReady) return false;
+    const popupSelection = currentRegionComplexPopupSelection();
+    if (!popupSelection || !popupSelection.complete) return false;
+    const selection = popupSelection;
     if (
       typeof api.shouldConfirmSelection !== 'function'
       || !api.shouldConfirmSelection({
         status: state.regionExportStatus,
         selectorWasExpanded: state.regionExportSelectorWasExpanded,
-        selectorExpanded: selectorExpanded && !complexListReady,
+        selectorExpanded: false,
         selection
       })
     ) return false;
     const trigger = currentRegionSelectorTrigger();
-    if (complexListReady && trigger) fallbackRegionExportClick(trigger);
+    if (trigger) fallbackRegionExportClick(trigger);
     state.regionExportSelectionKey = selection.key;
     state.regionExportSelectionLabel = selection.label;
-    state.regionExportSelectionProof = '';
-    if (complexListReady && popupSelection && popupSelection.complete) {
-      state.regionExportSelectionProof = 'selector-complete';
-    }
+    state.regionExportSelectionProof = 'selector-complete';
     state.regionExportSelectionError = '';
     state.regionExportStatus = 'confirming-region';
     return true;
@@ -2710,20 +2709,7 @@
 
   function ensureRegionConfirmingSelection() {
     if (state.regionExportStatus !== 'selecting-region') return;
-    if (refreshRegionExportSelectionState()) {
-      renderOverlay();
-      return;
-    }
-    const selection = currentRegionSelection();
-    if (!selection.complete) return;
-    state.regionExportSelectionKey = selection.key;
-    state.regionExportSelectionLabel = selection.label;
-    state.regionExportSelectionProof = currentRegionComplexPopupMatchesKey(selection.key)
-      ? 'selector-complete'
-      : '';
-    state.regionExportSelectionError = '';
-    state.regionExportStatus = 'confirming-region';
-    renderOverlay();
+    if (refreshRegionExportSelectionState()) renderOverlay();
   }
 
   function beginRegionExportSelectionFromOverlay() {
@@ -4260,7 +4246,11 @@
     const active = ['selecting-region', 'confirming-region'].includes(state.regionExportStatus);
     flow.hidden = !active;
     flow.classList.toggle('is-confirming', state.regionExportStatus === 'confirming-region');
-    if (!active) return;
+    if (!active) {
+      const staleOptions = flow.querySelector('.dhs-region-options');
+      if (staleOptions) { staleOptions.hidden = true; staleOptions.innerHTML = ''; }
+      return;
+    }
     const api = regionExportSelectionApi();
     const popupSelection = currentRegionSelectorExpanded() ? currentRegionComplexPopupSelection() : null;
     const confirmedSelection = typeof api.createSelection === 'function'

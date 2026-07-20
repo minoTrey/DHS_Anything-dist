@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DHS — 동·호수·매물정보 정리 확장 설치</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif; line-height: 1.7; color: #1a1a1a; background: #f6f7f9; }
+  @media (prefers-color-scheme: dark) { body { color: #e8e8e8; background: #14161a; } .card { background: #1e2127 !important; border-color: #2b2f37 !important; } code, kbd { background: #2b2f37 !important; } }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  .sub { color: #6b7280; margin: 0 0 24px; }
+  .ver { font-size: 13px; color: #6b7280; }
+  .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 14px; padding: 22px 24px; margin: 16px 0; }
+  .btn { display: inline-block; background: #2563eb; color: #fff; text-decoration: none; font-weight: 600; padding: 14px 26px; border-radius: 10px; font-size: 16px; }
+  .btn:active { transform: translateY(1px); }
+  ol { padding-left: 22px; } li { margin: 6px 0; }
+  code, kbd { background: #eef0f3; padding: 2px 6px; border-radius: 5px; font-size: 90%; }
+  .muted { color: #6b7280; font-size: 14px; }
+  h2 { font-size: 18px; margin: 26px 0 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>DHS — 동·호수·매물정보 정리</h1>
+  <p class="sub">네이버 부동산에서 동·호수와 매물 특징 정보를 정리해 주는 Chrome 확장</p>
+  <p class="ver">최신 버전: <strong id="ver">확인 중…</strong></p>
+
+  <div class="card">
+    <a class="btn" id="dl" href="DHS-Extension.zip" download>확장 다운로드 (.zip)</a>
+    <p class="muted" style="margin-top:14px;">한 번 설치하면, 이후 새 버전은 <strong>자동 업데이트</strong>됩니다 (아래 자동 업데이트 설치 참고).</p>
+  </div>
+
+  <div class="card">
+    <h2>설치 방법 (2분)</h2>
+    <ol>
+      <li>받은 <code>DHS-Extension.zip</code>의 압축을 풉니다.</li>
+      <li>Chrome 주소창에 <code>chrome://extensions</code> 입력 → 이동</li>
+      <li>오른쪽 위 <strong>개발자 모드</strong> 켜기</li>
+      <li><strong>압축해제된 확장 프로그램을 로드</strong> 클릭 → 압축 푼 <code>DHS-Extension</code> 폴더 선택</li>
+      <li>네이버 부동산 단지 페이지를 열고 매물을 클릭하면 오른쪽 아래에 진단 오버레이가 나타납니다.</li>
+    </ol>
+    <p class="muted">Node.js/npm 없이 브라우저만으로 동작합니다.</p>
+  </div>
+
+  <div class="card">
+    <h2>자동 업데이트</h2>
+    <p>새 버전이 나오면 확장 아이콘에 빨간 <strong>NEW</strong> 배지가 뜹니다. 자동 업데이터를 설치하면 백그라운드에서 최신 버전을 받아 <strong>다음 Chrome 재시작 시 자동 반영</strong>됩니다.</p>
+    <p class="muted" id="updater-note">자동 업데이터 설치 방법은 곧 여기에 추가됩니다.</p>
+  </div>
+
+  <p class="muted">문제가 있으면 배포자에게 문의하세요.</p>
+</div>
+<script>
+  fetch('version.json?_=' + Date.now()).then(function (r) { return r.json(); }).then(function (j) {
+    if (j && j.version) document.getElementById('ver').textContent = 'v' + j.version;
+  }).catch(function () { document.getElementById('ver').textContent = '(불러오기 실패)'; });
+</script>
+</body>
+</html>

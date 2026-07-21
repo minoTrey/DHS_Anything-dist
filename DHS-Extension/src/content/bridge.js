@@ -11,6 +11,20 @@
   const DOM_MUTATION_SCAN_DELAY_MS = 360;
   const PROVIDER_DISCOVERY_GRACE_SEC = 3;
   const PROVIDER_DIRECT_LOOKUP_FAST_FALLBACK_MS = 900;
+  // A provider direct-lookup that fails for a TRANSIENT reason (rate limit, timeout, http 5xx, tab/
+  // script infra hiccup) is retried a bounded number of times before falling back. This keeps the
+  // result consistent: without it, one transient miss drops the listing from a single exact to the
+  // weaker line-inference multi-candidate fallback, so the same listing resolves differently per run.
+  const PROVIDER_DIRECT_LOOKUP_MAX_RETRY = 2;
+  const PROVIDER_DIRECT_LOOKUP_TRANSIENT_REASONS = [
+    'http-error', 'non-json', 'no-response', 'timeout', 'timed-out', 'aborted',
+    'tab-unavailable', 'tab-create-failed', 'tab-fetch-error', 'script-error', 'script-empty'
+  ];
+  function isTransientProviderLookupFailure(signal) {
+    const value = String(signal || '');
+    if (/^http-(429|5\d\d)$/.test(value)) return true;
+    return PROVIDER_DIRECT_LOOKUP_TRANSIENT_REASONS.includes(value);
+  }
   const PROVIDER_ROUTE_LOOKUP_STALE_CLICK_RESUME_SEC = 8;
   const MAX_PROVIDER_GROUP_CONTEXT_LOOKUPS = 12;
   const ACTIVE_GROUP_ROUTE_MAX_BYTES = 1000000;
@@ -9235,6 +9249,28 @@
       if (response && response.ok) {
         scheduleScan('provider-direct-lookup');
         safeBridgeTask(pollProviderCandidate);
+        return;
+      }
+      // Retry the SAME lookup on a transient failure before giving up on it. A genuine no-match
+      // ('no-candidate', 'missing-key', ...) is NOT transient and falls through to the normal fallback.
+      const attempt = Number(settings.attempt || 0);
+      const failureSignal = String(
+        (response && (response.rejectReason || response.status || response.directLookupStatus)) || 'no-response'
+      );
+      if (
+        !fallbackStarted
+        && settings.fastFallback === false
+        && attempt < PROVIDER_DIRECT_LOOKUP_MAX_RETRY
+        && isTransientProviderLookupFailure(failureSignal)
+      ) {
+        state.providerRouteLookupBatchStatus = 'lookup-retry';
+        const backoffMs = Math.min(1500, 400 * (attempt + 1));
+        window.setTimeout(() => {
+          if (requestGeneration !== providerRequestGeneration) return;
+          if (requestKey !== (state.providerRequestKey || '')) return;
+          if (state.providerCandidatePresent) return;
+          runProviderDirectLookup(result, fallback, Object.assign({}, settings, { attempt: attempt + 1 }));
+        }, backoffMs);
         return;
       }
       if (!fallbackStarted) {

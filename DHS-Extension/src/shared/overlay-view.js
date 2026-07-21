@@ -501,6 +501,12 @@
     // open (hasSelectedListing = detailPanelPresent). With nothing selected (idle / 단지 정보 / group
     // parent) fall through to the idle view so stale scan state can't render "확인 필요"/"조사 중".
     if (hasSelectedListing) {
+    // While the resolver is still working (no confirmed exact, not genuinely settled), show a single
+    // clean "조사 중" route view — never a weak line-inference "N개 후보" or a premature "확인 결과
+    // 없음". These flicker and then flip to the real answer, which the user finds misleading.
+    if (state && state.investigationInProgress) {
+      return buildSelectedRouteView(state, routeSearchStatus(state));
+    }
     if (!providerRouteCandidatePending && hasDisplayableSingleEstimatedLineInference(state)) {
       return buildLineInferenceView(state);
     }
@@ -909,6 +915,18 @@
 
   function routeSearchStatus(state) {
     const input = state || {};
+    // While the investigation is still in progress, force the neutral "확인 중" status so no premature
+    // terminal ("확인 결과 없음") or negative verdict leaks into the selected-route view. The real
+    // terminal statuses below only apply once the resolver has genuinely settled.
+    if (input.investigationInProgress) {
+      return {
+        statusLabel: '확인 중',
+        statusTone: 'ready',
+        primaryValue: '매물 선택됨',
+        progressValue: '찾는 중',
+        helperText: '선택한 매물에서 동호수 확인 경로를 찾고 있습니다. 확인 위치와 마지막 변화 시간을 함께 표시합니다.'
+      };
+    }
     const autoLoopBlocked = input.autoLoopStatus === 'blocked' && input.autoLoopAction === 'record-blocker';
     const providerContinuation = hasContinuableDirectProviderTarget(input);
     const routeBlockedStop = input.groupRouteStatus === 'blocked'

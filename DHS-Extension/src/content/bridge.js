@@ -257,6 +257,10 @@
     detailContextPresent: false,
     articlePresent: false,
     articleMarker: '',
+    // Wall-clock investigation timer: stamped when a listing's marker first appears (≈ user click)
+    // so the "걸린시간" row measures click→done, not the resolver's internal FIN-lookup duration.
+    investigationClockMarker: '',
+    investigationStartedAtMs: 0,
     selectedArticleMarkerSource: '',
     representativeChildContextPresent: false,
     officialTabPresent: false,
@@ -605,6 +609,9 @@
   let lastSerializedProbe = '';
   const lineMapRecoveryKeys = new Set();
   let lineMapRecoveryPending = false;
+  // Debounce state for the display "resolver finished" signal (absorbs exhausted↔opening oscillation).
+  let settledLookMarker = '';
+  let settledLookSinceMs = 0;
   const currentArticleMkLookupAttemptKeys = new Set();
   const providerNameLookupAttemptKeys = new Set();
   const providerRouteLookupAttemptKeys = new Set();
@@ -4674,12 +4681,59 @@
     ) {
       return currentListingExactResolution(landLineDisplay);
     }
+    // Weak/negative verdicts (a line-inference N-\uD638 guess, a single estimate, or "\uBBF8\uD655\uC815") must NOT be
+    // shown while the resolver is still working toward a stronger provider/group capture that can
+    // collapse them to one exact \u2014 otherwise the overlay flickers "\uBBF8\uD655\uC815 \u2192 2\uAC1C \uD6C4\uBCF4 \u2192 1\uAC1C \uD655\uC815", which
+    // the user finds misleading. A confirmed exact is handled by the branches above and shows
+    // immediately; everything below is a not-yet-certain verdict, so gate it on `displaySettled`.
+    //
+    // `displaySettled` is true only when the resolver has genuinely stopped: the route search
+    // expired, OR a hard time cap elapsed (anti-hang), OR the loop reported no-result AND is not
+    // actively pursuing anything AND a short floor has passed (covers the startup window where the
+    // loop momentarily "exhausts" before the line map / route targets have even loaded).
+    const investigationAgeMs = Number(state.investigationStartedAtMs || 0) > 0
+      ? Math.max(0, Date.now() - Number(state.investigationStartedAtMs || 0))
+      : 0;
+    const resolverActivelyWorking = lineMapRecoveryPending
+      || ['opening', 'running'].includes(String(state.autoLoopStatus || ''))
+      || String(state.autoLoopAction || '') === 'scan-group-route'
+      || ['opening', 'direct-lookup', 'clicked', 'trusted-clicked'].includes(String(state.providerOpenStatus || ''))
+      || state.groupRouteStatus === 'fetching';
+    // The auto-loop oscillates exhausted↔opening between group-route retries, so a single "finished"
+    // tick must not count as a final settle — otherwise a weak line-inference candidate flashes for
+    // ~one tick before the loop resumes. Debounce: the finished-look must persist for a short window.
+    const nowMs = Date.now();
+    const settleLookMarker = normalizeText(state.articleMarker || '');
+    const finishedLook = investigationAgeMs >= 3000
+      && !resolverActivelyWorking
+      && isAutoLoopFinishedWithoutResult(state);
+    if (finishedLook && settledLookMarker === settleLookMarker && settledLookSinceMs > 0) {
+      // already tracking — keep the original start time
+    } else if (finishedLook) {
+      settledLookMarker = settleLookMarker;
+      settledLookSinceMs = nowMs;
+    } else {
+      settledLookMarker = '';
+      settledLookSinceMs = 0;
+    }
+    const finishedLookStable = finishedLook
+      && settledLookMarker === settleLookMarker
+      && settledLookSinceMs > 0
+      && (nowMs - settledLookSinceMs) >= 1600;
+    const displaySettled = state.routeSearchStatus === 'expired'
+      || investigationAgeMs >= 15000
+      || finishedLookStable;
     const candidateDisplay = regionExportCandidateDongHoDisplay();
-    if (candidateDisplay) return { dongHoStatus: 'multiple-candidates', dongHo: candidateDisplay };
+    if (candidateDisplay) {
+      if (!displaySettled) return { dongHoStatus: 'waiting', dongHo: '' };
+      return { dongHoStatus: 'multiple-candidates', dongHo: candidateDisplay };
+    }
     if (state.lineInferenceStatus === 'single-estimated' && state.lineInferenceDisplay) {
+      if (!displaySettled) return { dongHoStatus: 'waiting', dongHo: '' };
       return { dongHoStatus: 'multiple-candidates', dongHo: `\uD6C4\uBCF4: ${normalizeText(state.lineInferenceDisplay)}` };
     }
     if (isAutoLoopFinishedWithoutResult(state) || state.routeSearchStatus === 'expired') {
+      if (!displaySettled) return { dongHoStatus: 'waiting', dongHo: '' };
       return { dongHoStatus: 'unresolved', dongHo: REGION_EXPORT_UNRESOLVED_LABEL };
     }
     return { dongHoStatus: 'waiting', dongHo: '' };
@@ -4858,9 +4912,20 @@
     if (state.currentListingElapsedKey === contextKey) {
       return Number(state.currentListingElapsedSec || 0) || 0;
     }
-    const elapsedSec = cdpResolverFinalMatchesCurrentContext() && state.cdpResolverFinalDurationMs
-      ? Math.max(1, Math.ceil(state.cdpResolverFinalDurationMs / 1000))
-      : Math.max(1, Number(state.routeSearchElapsedSec || 0) || 0);
+    // Prefer the wall-clock investigation time (marker-appeared ≈ click → this terminal moment). This
+    // is captured ONCE per contextKey (the cache below freezes it), so it reflects the true
+    // click→done span the user perceives, not the resolver's internal FIN-lookup duration (~1s).
+    const activeMarker = normalizeText(state.articleMarker || '');
+    const wallElapsedMs = activeMarker
+      && state.investigationClockMarker === activeMarker
+      && Number(state.investigationStartedAtMs || 0) > 0
+      ? Math.max(0, Date.now() - Number(state.investigationStartedAtMs || 0))
+      : 0;
+    const elapsedSec = wallElapsedMs > 0
+      ? Math.max(1, Math.ceil(wallElapsedMs / 1000))
+      : (cdpResolverFinalMatchesCurrentContext() && state.cdpResolverFinalDurationMs
+        ? Math.max(1, Math.ceil(state.cdpResolverFinalDurationMs / 1000))
+        : Math.max(1, Number(state.routeSearchElapsedSec || 0) || 0));
     state.currentListingElapsedKey = contextKey;
     state.currentListingElapsedSec = elapsedSec;
     return elapsedSec;
@@ -6588,12 +6653,25 @@
     writeOverlayProbeDataset(overlay, currentListingOverlayRow);
 
     const selectionUiActive = ['selecting-region', 'confirming-region'].includes(state.regionExportStatus);
+    // Single source of truth for "the resolver is still working on the open listing". The row gate in
+    // currentListingResolution() returns dongHoStatus 'waiting' exactly while the investigation has
+    // neither confirmed an exact nor genuinely settled — so the overlay can key off this one flag to
+    // suppress ALL not-yet-certain verdicts (line-inference "N개 후보", premature "확인 결과 없음") and
+    // show a clean "조사 중" until the answer (or a real timeout) lands.
+    const investigationInProgress = Boolean(
+      !selectionUiActive
+      && selectedListingForRouteSearch()
+      && currentListingOverlayRow
+      && currentListingOverlayRow.dongHoStatus === 'waiting'
+    );
     const overlayState = Object.assign({}, state, selectionUiActive ? {
       regionExportStatus: 'idle',
       regionExportCurrentRow: null,
-      currentListingOverlayRow: null
+      currentListingOverlayRow: null,
+      investigationInProgress: false
     } : {
-      currentListingOverlayRow: currentListingOverlayRow
+      currentListingOverlayRow: currentListingOverlayRow,
+      investigationInProgress
     });
     const view = window.DHS_OVERLAY_VIEW
       ? window.DHS_OVERLAY_VIEW.buildOverlayView(overlayState)
@@ -10884,7 +10962,10 @@
     if (!api || typeof api.planLiveAutomation !== 'function') return;
     const decision = api.planLiveAutomation(Object.assign({}, state, {
       autoLoopAttemptedKeys: Array.from(autoLoopAttemptedKeys),
-      groupRouteTargets: groupRouteTargets()
+      groupRouteTargets: groupRouteTargets(),
+      // Surface the module-scoped line-map recovery flag so the planner can avoid giving up
+      // ('record-no-result') before the line map — which also yields provider/group targets — lands.
+      lineMapRecoveryPending
     }), {
       nowMs: autoLoopNowMs()
     });
@@ -10967,6 +11048,13 @@
 
     state.articlePresent = articleContext.articlePresent;
     state.articleMarker = articleContext.articleMarker;
+    // Start the wall-clock investigation timer the moment a NEW listing appears (≈ user click). The
+    // timer is frozen at the terminal resolution in currentListingElapsedSeconds().
+    const investigationClockMarker = normalizeText(state.articleMarker || '');
+    if (investigationClockMarker && state.investigationClockMarker !== investigationClockMarker) {
+      state.investigationClockMarker = investigationClockMarker;
+      state.investigationStartedAtMs = Date.now();
+    }
     state.selectedArticleMarkerSource = selectedArticleMarkerSource || (representativeChildContext ? 'representative-child' : '');
     state.representativeChildContextPresent = Boolean(representativeChildContext || selectedArticleMarkerSource === 'representative-child');
     const regionExportActiveForGate = ['preparing', 'running', 'saving'].includes(state.regionExportStatus);

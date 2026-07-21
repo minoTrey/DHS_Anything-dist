@@ -437,6 +437,17 @@
     const currentProviderAttempt = nextProviderAttempt(state);
     const currentGroupTargetAttempt = nextProviderGroupAttempt(state);
     const providerActionAvailable = Boolean(currentProviderAttempt || currentGroupTargetAttempt);
+    // The line map is the primary evidence source and also produces provider/group route targets.
+    // Concluding "record-no-result" before it lands is a premature terminal: it freezes the elapsed
+    // clock and lets weak line-inference candidates surface as if final, then flips when the real
+    // capture arrives. While the map is still being fetched (and the route search has not genuinely
+    // expired), keep waiting instead of giving up.
+    const lineMapStillArriving = state.lineMapRecoveryPending === true && !routeSearchExpired(state);
+    const giveUpDecision = (reason) => (
+      lineMapStillArriving
+        ? baseDecision('waiting', 'wait', 'line-map-recovery-pending')
+        : baseDecision('exhausted', 'record-no-result', reason)
+    );
 
     if (probe.status === 'done') return baseDecision('done', 'record-result', probe.reason);
     if (probe.status === 'blocked' && !directProviderTargetAvailable) return baseDecision('blocked', 'record-blocker', probe.reason);
@@ -479,7 +490,7 @@
         if (providerOpeningWithoutReject && recentlyOpened) {
           return baseDecision('waiting', 'wait', 'waiting-for-group-expansion');
         }
-        return baseDecision('exhausted', 'record-no-result', 'group-expansion-no-target');
+        return giveUpDecision('group-expansion-no-target');
       }
       if (providerOpeningWithoutReject && recentlyOpened) {
         return baseDecision('waiting', 'wait', 'waiting-for-group-expansion');
@@ -499,7 +510,7 @@
         if (providerOpeningWithoutReject && recentlyOpened) {
           return baseDecision('waiting', 'wait', 'waiting-for-group-expansion');
         }
-        return baseDecision('exhausted', 'record-no-result', 'group-expansion-no-target');
+        return giveUpDecision('group-expansion-no-target');
       }
       const groupTargetAttempt = providerTargetPhase(state) === 'direct-provider'
         ? currentGroupTargetAttempt
@@ -507,7 +518,7 @@
       if (groupTargetAttempt) return openingDecision('provider-group-target-ready', groupTargetAttempt);
       const groupFollowup = groupRouteFollowupDecision(state);
       if (groupFollowup) return groupFollowup;
-      return baseDecision('exhausted', 'record-no-result', 'provider-targets-exhausted');
+      return giveUpDecision('provider-targets-exhausted');
     }
 
     const rejected = Boolean(state.providerCandidateRejectedReason || providerStatus === 'mismatch');

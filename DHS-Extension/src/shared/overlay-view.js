@@ -627,7 +627,12 @@
     const providerCaptured = input.providerOpenStatus === 'captured'
       && !input.providerCandidateRejectedReason
       && String(input.resolverOutcome || '').startsWith('captured:');
-    if (input.providerCandidatePresent && input.providerCandidateDisplay && providerCaptured) {
+    if (
+      input.providerCandidatePresent
+      && input.providerCandidateDisplay
+      && providerCaptured
+      && Number(input.providerCandidateCount || 0) <= 1
+    ) {
       return {
         present: true,
         displayCandidate: String(input.providerCandidateDisplay),
@@ -637,7 +642,12 @@
     }
     const groupCaptured = !input.groupCandidateRejectedReason
       && String(input.resolverOutcome || '').startsWith('captured-group:');
-    if (input.groupCandidatePresent && input.groupCandidateDisplay && groupCaptured) {
+    if (
+      input.groupCandidatePresent
+      && input.groupCandidateDisplay
+      && groupCaptured
+      && Number(input.groupCandidateCount || 0) <= 1
+    ) {
       return {
         present: true,
         displayCandidate: String(input.groupCandidateDisplay),
@@ -741,14 +751,16 @@
 
   function hasAmbiguousGroupCandidates(state) {
     const input = state || {};
-    return input.groupCandidateRejectedReason === 'ambiguous-candidate'
-      && Number(input.groupCandidateCount || 0) > 1;
+    return Number(input.groupCandidateCount || 0) > 1
+      && (input.groupCandidateRejectedReason === 'ambiguous-candidate' || Boolean(input.groupCandidatePresent));
   }
 
   function hasAmbiguousProviderCandidates(state) {
     const input = state || {};
-    return input.providerCandidateRejectedReason === 'ambiguous-candidate'
-      && Number(input.providerCandidateCount || 0) > 1;
+    // More than one provider candidate — whether formally rejected as ambiguous, or captured but
+    // still not narrowed to a single unit — must show "후보 여러 개", never a single "확인 완료".
+    return Number(input.providerCandidateCount || 0) > 1
+      && (input.providerCandidateRejectedReason === 'ambiguous-candidate' || Boolean(input.providerCandidatePresent));
   }
 
   function buildAmbiguousProviderCandidateView(state) {
@@ -857,6 +869,10 @@
 
   function isSelectedListingState(state) {
     if (!state) return false;
+    // A listing counts as selected/tracked in the overlay ONLY when its real article detail panel
+    // is open. 단지 정보 (is-complex) and bare group parents expose an article context but have no
+    // article detail panel, so they must read as idle ("매물 선택 필요"), not "매물 선택됨".
+    if (!state.detailPanelPresent) return false;
     if (state.articlePresent || state.articleMarker) return true;
     if (state.detailContextPresent) return true;
     if (state.detailDongToken) return true;

@@ -7417,6 +7417,11 @@
   function scanDetailFloor() {
     const cdpFallback = cdpTargetContextFallback();
     const detailPanelText = detailText();
+    // A specific LISTING's article detail is open only when the '.detail_contents.is-article'
+    // container is visible. 단지 정보 renders '.detail_contents.is-complex' and a bare group
+    // parent renders no detail container — both must NOT count as a tracked listing.
+    const articleDetailPanelVisible = Array.from(document.querySelectorAll('.detail_contents.is-article'))
+      .some(isVisibleNode);
     const detailSignal = classifyListingText(detailPanelText);
     const detailTypeToken = extractDetailTypeToken(detailPanelText);
     const detailContext = {
@@ -7482,7 +7487,7 @@
     });
     return {
       detailScreenContextPresent: Boolean(text),
-      detailPanelPresent: Boolean(detailPanelText),
+      detailPanelPresent: articleDetailPanelVisible,
       detailContextPresent: Boolean(text || cdpFallback.detailDongToken || cdpFallback.detailTypeToken || cdpFallback.detailFloorKind !== 'none'),
       detailFloorKind: floorSignal.floorKind !== 'none' ? floorSignal.floorKind : cdpFallback.detailFloorKind,
       detailFloorBand: floorSignal.floorBand || cdpFallback.detailFloorBand,

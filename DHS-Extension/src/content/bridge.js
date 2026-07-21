@@ -598,6 +598,11 @@
   let activeGroupRoutesImportPromise = null;
   let autoLoopArticleMarker = '';
   const autoLoopAttemptedKeys = new Set();
+  // R3: last decision produced by updateAutoLoopDecision(), reused by the probe dataset writer
+  // within the same render cycle to avoid a redundant planLiveAutomation()+groupRouteTargets() pass.
+  let lastPlannedAutoLoopDecision = null;
+  // R4: last serialized data-dhs-probe payload; skip the DOM write when unchanged.
+  let lastSerializedProbe = '';
   const lineMapRecoveryKeys = new Set();
   let lineMapRecoveryPending = false;
   const currentArticleMkLookupAttemptKeys = new Set();
@@ -7011,14 +7016,18 @@
     const nextActions = liveApi && typeof liveApi.nextLiveActions === 'function'
       ? liveApi.nextLiveActions(liveResult)
       : [];
-    const plannedDecision = liveApi && typeof liveApi.planLiveAutomation === 'function'
-      ? liveApi.planLiveAutomation(Object.assign({}, state, {
-        autoLoopAttemptedKeys: Array.from(autoLoopAttemptedKeys),
-        groupRouteTargets: groupRouteTargets()
-      }), {
-        nowMs: autoLoopNowMs()
-      })
-      : { status: '', action: '', reason: '' };
+    // R3: reuse the decision already computed by updateAutoLoopDecision() this cycle. Fall back to a
+    // fresh plan only when the probe is written outside a scan cycle (standalone renderOverlay).
+    const plannedDecision = lastPlannedAutoLoopDecision
+      ? lastPlannedAutoLoopDecision
+      : (liveApi && typeof liveApi.planLiveAutomation === 'function'
+        ? liveApi.planLiveAutomation(Object.assign({}, state, {
+          autoLoopAttemptedKeys: Array.from(autoLoopAttemptedKeys),
+          groupRouteTargets: groupRouteTargets()
+        }), {
+          nowMs: autoLoopNowMs()
+        })
+        : { status: '', action: '', reason: '' });
     const plannedResult = {
       status: plannedDecision && plannedDecision.status || '',
       reason: plannedDecision && plannedDecision.reason || ''
@@ -7320,7 +7329,14 @@
       lastEvent: state.lastEvent || '',
       stop: Boolean(state.stop)
     };
-    overlay.setAttribute('data-dhs-probe', JSON.stringify(probe));
+    // R4: only touch the DOM attribute when the serialized probe actually changed. This avoids an
+    // attribute-write mutation on every render tick (which the overlay MutationObserver must filter),
+    // so a steady/idle state stops churning the DOM with identical diagnostic payloads.
+    const serializedProbe = JSON.stringify(probe);
+    if (serializedProbe !== lastSerializedProbe) {
+      lastSerializedProbe = serializedProbe;
+      overlay.setAttribute('data-dhs-probe', serializedProbe);
+    }
   }
 
   function elementText(element) {
@@ -10872,6 +10888,9 @@
     }), {
       nowMs: autoLoopNowMs()
     });
+    // R3: cache the freshly-planned decision so the per-render probe dataset can reuse it instead
+    // of re-running planLiveAutomation()+groupRouteTargets() a second time each cycle.
+    lastPlannedAutoLoopDecision = decision;
     applyAutoLoopDecision(decision);
     executeAutoLoopDecision(decision);
   }
@@ -10889,8 +10908,10 @@
     // (not the complex/URL marker) so it fires only on a real listing change — not every
     // tick when a listing legitimately resolves to a child marker differing from the URL.
     if (urlArticleMarker) lastArticleMarker = urlArticleMarker;
+    // Use textContent (no layout reflow) instead of innerText — this runs on up to a few hundred
+    // buttons/anchors every scan tick; innerText forced a full reflow each time.
     const officialTabPresent = Array.from(document.querySelectorAll('button, a')).some(
-      (element) => normalizeText(element.innerText || element.textContent) === DETAIL_TAB_TEXT
+      (element) => normalizeText(element.textContent) === DETAIL_TAB_TEXT
     );
     const detailFloor = scanDetailFloor();
     const cdpContextArticleMarker = cdpTargetArticleMarkerForDetail(detailFloor);
@@ -10983,6 +11004,13 @@
     state.officialCandidateDisplays = Array.isArray(officialTable.officialCandidateDisplays) ? officialTable.officialCandidateDisplays.slice() : [];
     state.officialExactCandidatePresent = Boolean(officialTable.officialExactCandidatePresent);
     state.officialExactCandidateDisplay = officialTable.officialExactCandidateDisplay || '';
+    // Skip the heavy detail-derived scans (line inference, group candidate, whole-document provider
+    // scan, resolver) when there's no open article detail (idle / 단지 정보 / group parent), or when
+    // the current article is already confirmed-exact latched — nothing to resolve or re-resolve.
+    // Skipping never re-derives the latch, so it cannot flip a confirmed result (no 0.1.301 regress).
+    const runHeavyScan = (state.detailPanelPresent || regionExportActiveForGate)
+      && !(state.confirmedExactDisplay && state.confirmedExactMarker && state.confirmedExactMarker === state.articleMarker);
+    if (runHeavyScan) {
     updateGroupFloorHint(activeDetailFloor);
     updateLineInference(activeDetailFloor);
     requestLineMapRecoveryAfterContext(activeDetailFloor);
@@ -11037,6 +11065,7 @@
     }
 
     updateConfirmedExactLatch();
+    }
 
     if (state.stop) {
       state.diagnosis = 'stop';
@@ -11129,12 +11158,18 @@
 
   function mutationTouchesOnlyOverlay(mutation) {
     if (!mutation) return false;
+    // The mutation target is the (still-attached) parent where the change happened. When the
+    // overlay re-renders (textContent/innerHTML replacement) the removed nodes are already
+    // detached, so tracing THEM back to the overlay fails and the mutation looks external —
+    // which fed a render→observe→scan loop. The target still resolves, so check it first: a
+    // change whose target is inside the overlay is overlay-only regardless of detached nodes.
+    if (nodeInsideDhsOverlay(mutation.target)) return true;
     const changedNodes = []
       .concat(Array.from(mutation.addedNodes || []))
       .concat(Array.from(mutation.removedNodes || []))
       .filter(Boolean);
     if (changedNodes.length > 0) return changedNodes.every(nodeInsideDhsOverlay);
-    return nodeInsideDhsOverlay(mutation.target);
+    return false;
   }
 
   function shouldScanForMutation(mutations) {

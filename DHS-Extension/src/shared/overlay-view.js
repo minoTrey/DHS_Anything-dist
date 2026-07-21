@@ -497,6 +497,10 @@
       return buildAmbiguousProviderCandidateView(state);
     }
 
+    // Active resolution / provider-target views only make sense while a listing's article detail is
+    // open (hasSelectedListing = detailPanelPresent). With nothing selected (idle / 단지 정보 / group
+    // parent) fall through to the idle view so stale scan state can't render "확인 필요"/"조사 중".
+    if (hasSelectedListing) {
     if (!providerRouteCandidatePending && hasDisplayableSingleEstimatedLineInference(state)) {
       return buildLineInferenceView(state);
     }
@@ -568,6 +572,7 @@
     if (hasSelectedListing) {
       const routeStatus = routeSearchStatus(state);
       return buildSelectedRouteView(state, routeStatus);
+    }
     }
 
     return {

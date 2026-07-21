@@ -7042,8 +7042,6 @@
       representativeChildContextPresent: Boolean(state.representativeChildContextPresent),
       detailPanelPresent: Boolean(state.detailPanelPresent),
       groupedListingSelectionPending: Boolean(state.groupedListingSelectionPending),
-      scanTickCount: Number(state.scanTickCount || 0),
-      lastScanMs: Number(state.lastScanMs || 0),
       selectedListingPresent: Boolean(state.articleMarker || state.articlePresent || state.detailContextPresent),
       detailScreenContextPresent: Boolean(state.detailScreenContextPresent),
       detailContextPresent: Boolean(state.detailContextPresent),
@@ -10875,14 +10873,7 @@
     executeAutoLoopDecision(decision);
   }
 
-  let cachedProviderSignal = null;
-  let lastHeavyScanSig = null;
-  let lastHeavyScanAt = 0;
-
   function scanPage() {
-    const __p = (typeof performance !== 'undefined' && performance.now) ? () => performance.now() : () => Date.now();
-    const __scanStart = __p();
-    state.scanTickCount = (state.scanTickCount || 0) + 1;
     refreshRegionExportSelectionState();
     const listingStats = scanListingStats();
     Object.assign(state, listingStats);
@@ -10990,46 +10981,18 @@
     state.officialCandidateDisplays = Array.isArray(officialTable.officialCandidateDisplays) ? officialTable.officialCandidateDisplays.slice() : [];
     state.officialExactCandidatePresent = Boolean(officialTable.officialExactCandidatePresent);
     state.officialExactCandidateDisplay = officialTable.officialExactCandidateDisplay || '';
-    // Recompute the heavy detail-derived scans (line inference, group candidate) and the
-    // provider-context scan only when the DOM/article context may have changed since last run
-    // (a non-interval scan trigger marked it dirty) or the cache is older than the max-stale
-    // bound. On idle interval ticks with no change, reuse the prior results — same values,
-    // far less work. Staleness is bounded to PROVIDER_SIGNAL_MAX_STALE_MS (≤ the scan interval).
-    const __heavySettled = state.routeSearchStatus !== 'active'
-      && !['opening', 'clicked', 'trusted-clicked', 'direct-lookup'].includes(state.providerOpenStatus || '');
-    const __heavySig = [
-      articleContext.articleMarker, activeDetailFloor.detailDongToken, activeDetailFloor.detailTypeToken,
-      activeDetailFloor.dealType, detailContextPresent ? '1' : '0', state.providerOpenStatus, state.routeSearchStatus,
-      state.lineInferenceStatus, state.cpProviderEvidenceSeen ? '1' : '0',
-      state.sameAddressEvidenceSeen ? '1' : '0', state.representativeEvidenceSeen ? '1' : '0'
-    ].join('|');
-    const __recomputeHeavy = __heavySig !== lastHeavyScanSig
-      || !cachedProviderSignal
-      || (__p() - lastHeavyScanAt) >= (__heavySettled ? 2000 : 700);
-    if (__recomputeHeavy) {
-      updateGroupFloorHint(activeDetailFloor);
-      updateLineInference(activeDetailFloor);
-      requestLineMapRecoveryAfterContext(activeDetailFloor);
-      updateGroupCandidate(activeDetailFloor);
-      updateLandLinePromotion();
-    }
+    updateGroupFloorHint(activeDetailFloor);
+    updateLineInference(activeDetailFloor);
+    requestLineMapRecoveryAfterContext(activeDetailFloor);
+    updateGroupCandidate(activeDetailFloor);
+    updateLandLinePromotion();
     const kbAlias = kbAliasEvidenceFromLocation();
     if (kbAlias.present) {
       state.kbAliasEvidenceSeen = true;
       state.kbAliasMarker = kbAlias.aliasMarker || state.kbAliasMarker;
       state.kbAliasReadiness = 'direct-alias';
     }
-    let cpSignal;
-    if (!__recomputeHeavy && cachedProviderSignal) {
-      cpSignal = cachedProviderSignal;
-    } else {
-      cpSignal = scanProviderContext(activeDetailFloor);
-      cachedProviderSignal = cpSignal;
-    }
-    if (__recomputeHeavy) {
-      lastHeavyScanSig = __heavySig;
-      lastHeavyScanAt = __p();
-    }
+    const cpSignal = scanProviderContext(activeDetailFloor);
     const providerFamilies = activeProviderFamilies(cpSignal);
     state.cpTextSignalPresent = cpSignal.present;
     state.cpTextSignalStrong = cpSignal.strong;
@@ -11088,7 +11051,6 @@
     updateRouteSearchState();
     updateAutoLoopDecision();
     renderOverlay();
-    state.lastScanMs = __p() - __scanStart;
   }
 
   function forceOfficialTableRescanForCdp() {

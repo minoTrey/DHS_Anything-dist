@@ -10003,14 +10003,12 @@
   }
 
   function selectedListingForRouteSearch() {
-    if (state.groupedListingSelectionPending) return false;
-    return Boolean(
-      state.articlePresent ||
-      state.articleMarker ||
-      state.detailContextPresent ||
-      state.detailDongToken ||
-      (state.detailFloorKind && state.detailFloorKind !== 'none')
-    );
+    // Track dong-ho ONLY when a specific listing's real detail panel is open — i.e. the user
+    // opened a child of a grouped listing, or a non-grouped listing. A bare group-parent click
+    // just expands the group (no detail panel) and must not trigger tracking, and nothing is
+    // ever auto-selected. Region extraction drives its own tracking, so allow it too.
+    return Boolean(state.detailPanelPresent)
+      || ['preparing', 'running', 'saving'].includes(state.regionExportStatus);
   }
 
   function updateRouteSearchState() {
@@ -10880,7 +10878,6 @@
 
     const previousScanArticleMarker = state.articleMarker || lastArticleMarker || '';
     const urlArticleMarker = articleMarkerFromUrl();
-    maybeAutoSelectRepresentativeChild();
     const selectedArticleMarker = articleMarkerFromSelectedListing();
     const representativeChildContext = representativeChildContextActive();
     // The article-changed reset is applied below, keyed off the RESOLVED article marker

@@ -203,14 +203,11 @@
 
   function selectedListingActive(state) {
     const input = state || {};
-    if (input.groupedListingSelectionPending) return false;
-    return Boolean(
-      input.articlePresent ||
-      input.articleMarker ||
-      input.detailContextPresent ||
-      input.detailDongToken ||
-      (input.detailFloorKind && input.detailFloorKind !== 'none')
-    );
+    // Investigate only when a specific listing's real detail panel is open (user opened a
+    // grouped child or a non-grouped listing), or during region extraction. Never on a bare
+    // group-parent selection, and nothing is auto-selected.
+    return Boolean(input.detailPanelPresent)
+      || ['preparing', 'running', 'saving'].includes(input.regionExportStatus);
   }
 
   function safeArticleMarker(value) {

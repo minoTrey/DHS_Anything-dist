@@ -7,8 +7,6 @@
     'span.agent_info',
     'button.agent_info',
     '.label--multicp',
-    'a.item_link[data-nclk="TAA.groupo"]',
-    'a.item_link[role="button"]',
     'button[aria-label*="\uC911\uAC1C\uC0AC"]',
     'button[title*="\uC911\uAC1C\uC0AC"]',
     'button'
@@ -768,7 +766,23 @@
     return (hasClass(element, 'item') && hasClass(element, 'is-expanded')) || hasExpandedListingLink(element);
   }
 
+  function isListingLinkClickTarget(element) {
+    return elementMatches(element, 'a.item_link')
+      || elementMatches(element, '[data-nclk="TAA.groupo"]');
+  }
+
   function findProviderClickTarget(documentRef, context) {
+    const result = findProviderClickTargetInner(documentRef, context);
+    // Never click a listing/group link — clicking `a.item_link` expands/collapses the 동일매물
+    // group and navigates/selects a listing on its own. Only real provider/agent elements may be
+    // clicked; dong-ho is resolved from the already-open detail panel's own provider links.
+    if (result && result.target && isListingLinkClickTarget(result.target)) {
+      return { status: 'no-target', count: 0, target: null, phase: result.phase || '', providerFamilies: [], targetProviderFamily: '' };
+    }
+    return result;
+  }
+
+  function findProviderClickTargetInner(documentRef, context) {
     const doc = documentRef || (typeof document !== 'undefined' ? document : null);
     if (!doc || typeof doc.querySelectorAll !== 'function') {
       return { status: 'no-target', count: 0, target: null };

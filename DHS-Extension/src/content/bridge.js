@@ -271,6 +271,7 @@
     // so the "걸린시간" row measures click→done, not the resolver's internal FIN-lookup duration.
     investigationClockMarker: '',
     investigationStartedAtMs: 0,
+    selectedListingGroupKey: '',
     selectedArticleMarkerSource: '',
     representativeChildContextPresent: false,
     officialRowsPresent: false,
@@ -595,8 +596,6 @@
   let lastClickedListingText = '';
   let lastClickedListingSource = '';
   let selectedArticleMarkerSource = '';
-  let representativeChildSelectionKey = '';
-  let representativeChildSelectionAt = 0;
   let lastExpandedListingText = '';
   let lastExpandedListingAt = 0;
   let lastExpandedListingRootCount = 0;
@@ -621,6 +620,11 @@
   // Debounce state for the display "resolver finished" signal (absorbs exhausted↔opening oscillation).
   let settledLookMarker = '';
   let settledLookSinceMs = 0;
+  // 동일매물(same-unit) group → confirmed exact cache. Keyed by the group's sorted sibling articleNos.
+  // Because grouped children are literally the same unit listed by different brokers, once ANY child
+  // confirms the exact 동/호, its siblings can inherit it instead of each running its own (sometimes
+  // failing, always slower) provider search. Bounded; safety-gated at read time.
+  const groupExactCache = new Map();
   const currentArticleMkLookupAttemptKeys = new Set();
   const providerNameLookupAttemptKeys = new Set();
   const providerRouteLookupAttemptKeys = new Set();
@@ -1523,6 +1527,38 @@
     return isGroupedParentListingRoot(root);
   }
 
+  // Stable identity of the 동일매물 group the currently-open child belongs to: the sorted set of its
+  // siblings' articleNos. Empty unless the selection is a grouped child with >=2 members (so a lone
+  // listing never shares a key). Used to inherit a sibling's confirmed exact.
+  function selectedListingGroupKey() {
+    const roots = selectedListingRoots({ preserveParent: true });
+    for (const root of roots) {
+      if (!root || !(root.closest && root.closest('.item--child'))) continue;
+      const parent = childListingParentRoot(root);
+      if (!parent) continue;
+      const articleNos = childListingRootsForParent(parent)
+        .map((sibling) => articleNoFromListingRoot(sibling))
+        .filter(Boolean)
+        .map((value) => String(value));
+      const unique = Array.from(new Set(articleNos)).sort();
+      if (unique.length >= 2) return unique.join(',');
+    }
+    return '';
+  }
+
+  // Safety gate for inheriting a group sibling's exact: the inherited 동/호 must be consistent with
+  // THIS child's own line-inference candidate set when one exists (they are the same unit, so the
+  // sibling's answer must appear among this child's candidates). With no candidate set to contradict,
+  // the caller still validates dong/floor via currentListingExactResolution.
+  function groupExactConsistentWithChild(display) {
+    const candidates = Array.isArray(state.lineInferenceCandidateDisplays)
+      ? state.lineInferenceCandidateDisplays
+      : [];
+    if (!candidates.length) return true;
+    const target = normalizeText(display);
+    return candidates.some((candidate) => normalizeText(candidate) === target);
+  }
+
   function expandedListingRootKey(text) {
     return normalizeText(text).replace(/\s+/g, ' ').slice(0, 2000);
   }
@@ -1617,49 +1653,10 @@
     return '';
   }
 
-  function representativeChildSelectionCandidate() {
-    const parentRoots = selectedListingRoots({ preserveParent: true })
-      .concat(expandedParentListingRoots())
-      .filter(Boolean)
-      .filter((element, index, list) => list.indexOf(element) === index);
-    for (const root of parentRoots) {
-      if (root.closest && root.closest('.item--child')) continue;
-      const childRoot = representativeChildListingRoot(root);
-      if (!childRoot || !isVisibleNode(childRoot)) continue;
-      const target = listingClickTarget(childRoot);
-      if (!target || !isVisibleNode(target)) continue;
-      const articleNo = articleNoFromListingRoot(childRoot);
-      const textKey = expandedListingRootKey(listingTextForSelectionRoot(childRoot));
-      const key = articleNo ? `article:${articleNo}` : `child:${textKey}`;
-      if (!key) continue;
-      return { root: childRoot, target, key };
-    }
-    return null;
-  }
-
-  function rememberRepresentativeChildSelection(candidate) {
-    if (!candidate || !candidate.root || !isVisibleNode(candidate.root)) return false;
-    lastClickedListingRoot = candidate.root;
-    lastClickedListingAt = Date.now();
-    lastClickedListingText = listingTextForSelectionRoot(candidate.root);
-    lastClickedListingSource = 'auto';
-    selectedArticleMarkerSource = 'representative-child';
-    return Boolean(lastClickedListingText || articleNoFromListingRoot(candidate.root));
-  }
-
-  function maybeAutoSelectRepresentativeChild() {
-    const candidate = representativeChildSelectionCandidate();
-    if (!candidate) return;
-    // A fresh, explicit user click on a different listing wins over auto-selecting the group's
-    // representative child (otherwise clicking 101동 gets clobbered back to the representative).
-    const userClickedRoot = recentClickedListingRoot();
-    if (userClickedRoot && userClickedRoot !== candidate.root && lastClickedListingSource === 'user') return;
-    const now = Date.now();
-    if (candidate.key === representativeChildSelectionKey && (now - representativeChildSelectionAt) < 60000) return;
-    representativeChildSelectionKey = candidate.key;
-    representativeChildSelectionAt = now;
-    rememberRepresentativeChildSelection(candidate);
-  }
+  // (Removed) The representative-child auto-select cluster — maybeAutoSelectRepresentativeChild /
+  // representativeChildSelectionCandidate / rememberRepresentativeChildSelection — was dead (no
+  // caller) and implemented the forbidden auto-select ("nothing is ever auto-selected"). It was the
+  // ONLY writer of lastClickedListingSource='auto'; the field is now only ever '' or 'user'.
 
   function floorSignalsMatch(left, right) {
     if (!left || !right) return false;
@@ -4844,15 +4841,35 @@
     }
     if (!marker) return;
     if (state.confirmedExactMarker === marker && state.confirmedExactDisplay) return;
+    const groupKey = normalizeText(state.selectedListingGroupKey || '');
     const source = currentExactEvidenceReceiptSource();
-    if (!source) return;
-    const display = normalizeText(confirmedExactDisplayForSource(source) || '');
+    let display = '';
+    let kind = source;
+    if (source) {
+      display = normalizeText(confirmedExactDisplayForSource(source) || '');
+    } else if (groupKey) {
+      // No own evidence yet — but a sibling of the same 동일매물 group already confirmed the unit.
+      // Inherit it (validated below), so this child shows the answer immediately instead of running
+      // its own slow/sometimes-failing provider search.
+      const inherited = groupExactCache.get(groupKey);
+      if (inherited && inherited.display && groupExactConsistentWithChild(inherited.display)) {
+        display = normalizeText(inherited.display);
+        kind = 'group-inherited';
+      }
+    }
     if (!display) return;
     if (currentListingExactResolution(display).dongHoStatus !== 'exact') return;
     state.confirmedExactMarker = marker;
     state.confirmedExactDisplay = display;
-    state.confirmedExactKind = source;
+    state.confirmedExactKind = kind;
     state.confirmedExactAt = autoLoopNowMs();
+    // Seed the group cache from an OWN confirmation so later-opened siblings can inherit it.
+    if (source && groupKey) {
+      groupExactCache.set(groupKey, { display: display });
+      if (groupExactCache.size > 50) {
+        groupExactCache.delete(groupExactCache.keys().next().value);
+      }
+    }
   }
 
   function currentListingFloorForOverlay() {
@@ -7428,6 +7445,8 @@
       lastEvidenceCategory: state.lastEvidenceCategory || '',
       lastEvidenceStatus: state.lastEvidenceStatus || '',
       lastEvent: state.lastEvent || '',
+      confirmedExactKind: state.confirmedExactKind || '',
+      selectedListingGroupKey: state.selectedListingGroupKey || '',
       stop: Boolean(state.stop)
     };
     // R4: only touch the DOM attribute when the serialized probe actually changed. This avoids an
@@ -11123,6 +11142,9 @@
     state.groupedListingSelectionPending = !regionExportActiveForGate
       && !effectiveDetailPanelPresent
       && groupedSelectionContext;
+    // Identity of the same-unit group this open child belongs to (empty unless a grouped child is
+    // actually open) — the key for inheriting a sibling's confirmed exact.
+    state.selectedListingGroupKey = effectiveDetailPanelPresent ? selectedListingGroupKey() : '';
     state.detailScreenContextPresent = Boolean(activeDetailFloor.detailScreenContextPresent);
     state.detailContextPresent = detailContextPresent;
     state.detailFloorKind = activeDetailFloor.detailFloorKind;
@@ -12136,10 +12158,12 @@
     bridgeObserver = new MutationObserver((mutations) => {
       if (shouldScanForMutation(mutations)) scheduleScan('dom-mutation');
     });
+    // Structural detection only needs childList/subtree — a new detail panel arrives as a node
+    // insertion. characterData:true additionally fired on ambient map/marker/price-bubble TEXT
+    // animation across the whole document, sustaining needless mutation-driven scans (버벅임); dropped.
     bridgeObserver.observe(document.documentElement, {
       childList: true,
-      subtree: true,
-      characterData: true
+      subtree: true
     });
     popstateListener = () => scheduleScan('popstate');
     window.addEventListener('popstate', popstateListener);

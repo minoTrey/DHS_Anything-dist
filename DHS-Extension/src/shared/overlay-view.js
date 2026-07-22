@@ -639,7 +639,9 @@
       return {
         present: true,
         displayCandidate: String(input.confirmedExactDisplay),
-        routeLabel: providerLabel(input.cpProviderFamilies),
+        routeLabel: input.confirmedExactKind === 'group-inherited'
+          ? '같은 매물(동일매물)'
+          : providerLabel(input.cpProviderFamilies),
         kind: input.confirmedExactKind || 'provider'
       };
     }
@@ -715,6 +717,8 @@
     let sourceText = '\uD604\uC7AC \uC120\uD0DD\uD55C \uB9E4\uBB3C\uACFC \uC81C\uACF5\uCC98 \uD398\uC774\uC9C0 \uD6C4\uBCF4\uAC00 \uC77C\uCE58\uD574 \uD655\uC778\uB41C \uAC12\uC785\uB2C8\uB2E4.';
     if (candidate.kind === 'group') {
       sourceText = '\uD604\uC7AC \uC120\uD0DD\uD55C \uB9E4\uBB3C\uACFC \uAC19\uC740\uB9E4\uBB3C \uD6C4\uBCF4\uAC00 \uB3D9\u00B7\uCE35 \uC870\uAC74\uC744 \uD1B5\uACFC\uD574 \uD655\uC778\uB41C \uAC12\uC785\uB2C8\uB2E4.';
+    } else if (candidate.kind === 'group-inherited') {
+      sourceText = '\uAC19\uC740 \uB9E4\uBB3C(\uB3D9\uC77C\uB9E4\uBB3C)\uB85C \uBB36\uC778 \uB2E4\uB978 \uBB3C\uAC74\uC5D0\uC11C \uC774\uBBF8 \uD655\uC778\uB41C \uB3D9\u00B7\uD638\uC218\uC785\uB2C8\uB2E4. \uAC19\uC740 \uC138\uB300\uC774\uBBC0\uB85C \uB3D9\uC77C\uD558\uAC8C \uD45C\uC2DC\uD569\uB2C8\uB2E4.';
     } else if (candidate.kind === 'land-line-provider-floor') {
       sourceText = '\uC81C\uACF5\uCC98 \uC815\uD655\uCE35 \uB2E8\uC11C\uC640 \uD604\uC7AC \uB9E4\uBB3C\uC758 \uD3C9\uD615\u00B7\uB77C\uC778 \uC790\uB8CC\uAC00 \uD568\uAED8 \uD1B5\uACFC\uD574 \uD655\uC778\uB41C \uAC12\uC785\uB2C8\uB2E4.';
     } else if (candidate.kind === 'land-line-provider-route-single') {

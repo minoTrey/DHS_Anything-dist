@@ -557,6 +557,12 @@
     // Snapshot of the chosen 시/구/동 values, frozen at the first complete selection of a picking
     // session so the overlay name doesn't churn as Naver's live filter (.area.is-selected) shifts.
     regionExportSelectionValues: [],
+    // DHS-native region picker (fed by Naver's public regions/list API, NO visual-selector driving,
+    // so the map does NOT react while the user picks 시/도→시/군/구→읍/면/동). The visual selector is
+    // only driven later, on 추출하기, to apply the chosen region to Naver.
+    regionPickerOptions: [],   // current level's [{cortarNo, cortarName, cortarType}]
+    regionPickerPath: [],      // chosen path [{cortarNo, cortarName, cortarType}] (len 0..3)
+    regionPickerLoading: false,
     regionExportSelectionProof: '',
     regionExportSelectionLevel: 'sido',
     regionExportSelectorWasExpanded: false,
@@ -2589,33 +2595,10 @@
   }
 
   function refreshRegionExportSelectionState() {
-    if (state.regionExportStatus !== 'selecting-region') return false;
-    const api = regionExportSelectionApi();
-    const selectorExpanded = currentRegionSelectorExpanded();
-    if (selectorExpanded) state.regionExportSelectorWasExpanded = true;
-    if (!state.regionExportSelectorReady) return false;
-    const complexListReady = selectorExpanded && collectCurrentRegionComplexOptions().length > 0;
-    if (!complexListReady) return false;
-    const popupSelection = currentRegionComplexPopupSelection();
-    if (!popupSelection || !popupSelection.complete) return false;
-    const selection = popupSelection;
-    if (
-      typeof api.shouldConfirmSelection !== 'function'
-      || !api.shouldConfirmSelection({
-        status: state.regionExportStatus,
-        selectorWasExpanded: state.regionExportSelectorWasExpanded,
-        selectorExpanded: false,
-        selection
-      })
-    ) return false;
-    const trigger = currentRegionSelectorTrigger();
-    if (trigger) fallbackRegionExportClick(trigger);
-    state.regionExportSelectionKey = selection.key;
-    state.regionExportSelectionLabel = selection.label;
-    state.regionExportSelectionProof = 'selector-complete';
-    state.regionExportSelectionError = '';
-    state.regionExportStatus = 'confirming-region';
-    return true;
+    // No-op in the DHS-native picker: the selecting→confirming transition now happens synchronously in
+    // pickCurrentRegionOptionFromOverlay (leaf 동 picked). This used to poll Naver's visual selector,
+    // which is exactly what made the map react during selection. Kept for scanPage() call compatibility.
+    return false;
   }
 
   function regionSelectionOptionFromEventTarget(target) {
@@ -2732,6 +2715,130 @@
     });
   }
 
+  // ── DHS-native region picker (API-driven, NO visual-selector driving) ─────────────────
+  // The user picks 시/도→시/군/구→읍/면/동 entirely inside the DHS card. Options come from Naver's
+  // OWN public same-origin endpoint /api/regions/list (the exact source Naver's visual filter is
+  // rendered from — cortarName === the visual label text, verified live), so the map does NOT react
+  // while picking. The visual selector is only driven LATER, on 추출하기, by
+  // restoreCurrentRegionExportSelection (name-matched) to apply the chosen region to Naver + extract.
+  const REGION_PICKER_TOP_CORTAR_NO = '0000000000';
+  const regionPickerListCache = new Map(); // cortarNo -> [{cortarNo, cortarName, cortarType}]
+  let regionPickerLoadToken = 0;
+
+  async function fetchRegionPickerList(cortarNo) {
+    const key = String(cortarNo || REGION_PICKER_TOP_CORTAR_NO);
+    if (regionPickerListCache.has(key)) return regionPickerListCache.get(key);
+    const regionsResponse = await fetch(
+      `https://new.land.naver.com/api/regions/list?cortarNo=${encodeURIComponent(key)}`,
+      { credentials: 'include', headers: { accept: 'application/json' } }
+    );
+    if (!regionsResponse.ok) throw new Error(`region-list-http-${regionsResponse.status}`);
+    const body = await regionsResponse.json();
+    const list = (Array.isArray(body && body.regionList) ? body.regionList : [])
+      .map((entry) => ({
+        cortarNo: String(entry && entry.cortarNo || ''),
+        cortarName: normalizeText(entry && entry.cortarName || ''),
+        cortarType: String(entry && entry.cortarType || '')
+      }))
+      .filter((entry) => entry.cortarNo && entry.cortarName);
+    regionPickerListCache.set(key, list);
+    return list;
+  }
+
+  // Load the option list for the level whose parent is `parentCortarNo`. `pathLen` is how many levels
+  // are already chosen (0 → 시/도 list). Guards against stale async with a monotonic token.
+  function loadRegionPickerLevel(parentCortarNo, pathLen) {
+    const token = (regionPickerLoadToken += 1);
+    state.regionPickerLoading = true;
+    state.regionPickerOptions = [];
+    state.regionExportSelectionLevel = REGION_EXPORT_SELECTION_LEVELS[
+      Math.min(pathLen, REGION_EXPORT_SELECTION_LEVELS.length - 1)
+    ];
+    renderOverlay();
+    fetchRegionPickerList(parentCortarNo)
+      .then((list) => {
+        if (token !== regionPickerLoadToken) return;
+        if (state.regionExportStatus !== 'selecting-region') return;
+        state.regionPickerOptions = list;
+        state.regionPickerLoading = false;
+        state.regionExportSelectionError = list.length ? '' : 'region-option-unavailable';
+        renderOverlay();
+      })
+      .catch((error) => {
+        if (isRuntimeInvalidationError(error)) { markRuntimeUnavailable(error); return; }
+        if (token !== regionPickerLoadToken) return;
+        if (state.regionExportStatus !== 'selecting-region') return;
+        state.regionPickerLoading = false;
+        state.regionPickerOptions = [];
+        state.regionExportSelectionError = 'region-list-fetch-failed';
+        renderOverlay();
+      });
+  }
+
+  function regionPickerApplyPath() {
+    const path = Array.isArray(state.regionPickerPath) ? state.regionPickerPath : [];
+    state.regionExportSelectionValues = path.map((entry) => entry.cortarName).slice(0, 3);
+  }
+
+  // User picked one option (by cortarNo) in the DHS card. Drill down; when a leaf (읍/면/동, type 'sec'
+  // OR path reaches 3) is chosen, the selection is complete → confirming-region. NEVER touches Naver.
+  function pickCurrentRegionOptionFromOverlay(cortarNo) {
+    if (state.regionExportStatus !== 'selecting-region') return false;
+    const options = Array.isArray(state.regionPickerOptions) ? state.regionPickerOptions : [];
+    const picked = options.find((entry) => entry.cortarNo === String(cortarNo || ''));
+    if (!picked) return false;
+    const path = (Array.isArray(state.regionPickerPath) ? state.regionPickerPath : []).slice(0, 2);
+    path.push(picked);
+    state.regionPickerPath = path;
+    regionPickerApplyPath();
+    state.regionExportSelectionError = '';
+    const isLeaf = picked.cortarType === 'sec' || path.length >= 3;
+    if (isLeaf) {
+      const api = regionExportSelectionApi();
+      const selection = typeof api.createSelection === 'function'
+        ? api.createSelection(path.map((entry) => entry.cortarName))
+        : { complete: false, key: '', label: '' };
+      if (!selection.complete) {
+        // Non-leaf that Naver classifies oddly: fall back to drilling one more level.
+        loadRegionPickerLevel(picked.cortarNo, path.length);
+        return true;
+      }
+      state.regionPickerOptions = [];
+      state.regionPickerLoading = false;
+      state.regionExportSelectionKey = selection.key;
+      state.regionExportSelectionLabel = selection.label;
+      state.regionExportSelectionValues = selection.values.slice(0, 3);
+      state.regionExportSelectionProof = 'dhs-picker';
+      state.regionExportStatus = 'confirming-region';
+      renderOverlay();
+      return true;
+    }
+    loadRegionPickerLevel(picked.cortarNo, path.length);
+    return true;
+  }
+
+  // Clicking a step chip (1/2/3) re-opens that level for re-picking: truncate the path to that level and
+  // reload its options from the parent above it.
+  function chooseCurrentRegionLevelFromOverlay(level) {
+    if (!['selecting-region', 'confirming-region'].includes(state.regionExportStatus)) return false;
+    const levelIndex = Math.max(0, REGION_EXPORT_SELECTION_LEVELS.indexOf(normalizeRegionSelectionLevel(level)));
+    const fullPath = Array.isArray(state.regionPickerPath) ? state.regionPickerPath : [];
+    // Only allow jumping to an already-reachable level (<= current depth).
+    if (levelIndex > fullPath.length) return false;
+    state.regionExportStatus = 'selecting-region';
+    state.regionExportSelectionKey = '';
+    state.regionExportSelectionLabel = '';
+    state.regionExportSelectionProof = '';
+    state.regionExportSelectionError = '';
+    state.regionPickerPath = fullPath.slice(0, levelIndex);
+    regionPickerApplyPath();
+    const parentCortarNo = levelIndex === 0
+      ? REGION_PICKER_TOP_CORTAR_NO
+      : state.regionPickerPath[levelIndex - 1].cortarNo;
+    loadRegionPickerLevel(parentCortarNo, levelIndex);
+    return true;
+  }
+
   function requestConfirmedCurrentRegionExport(confirmedSelectionKey) {
     exportCurrentRegionFromOverlay(false, confirmedSelectionKey).catch((error) => {
       if (isRuntimeInvalidationError(error)) {
@@ -2744,43 +2851,10 @@
     });
   }
 
-  function pickCurrentRegionOptionFromOverlay(optionText) {
-    const text = normalizeText(optionText);
-    if (!text) return false;
-    if (!['selecting-region', 'confirming-region'].includes(state.regionExportStatus)) return false;
-    state.regionExportStatus = 'selecting-region';
-    state.regionExportSelectionKey = '';
-    state.regionExportSelectionLabel = '';
-    state.regionExportSelectionProof = '';
-    state.regionExportSelectionError = '';
-    selectCurrentRegionSelectorOption(text)
-      .then((picked) => {
-        if (!picked && state.regionExportStatus === 'selecting-region') {
-          state.regionExportSelectionError = 'region-option-unavailable';
-        }
-        const chosen = currentRegionSelection();
-        state.regionExportSelectionLevel = REGION_EXPORT_SELECTION_LEVELS[
-          Math.min(chosen.values.length, REGION_EXPORT_SELECTION_LEVELS.length - 1)
-        ];
-        scheduleRegionSelectionUiRefresh(text);
-        renderOverlay();
-      })
-      .catch((error) => {
-        if (isRuntimeInvalidationError(error)) {
-          markRuntimeUnavailable(error);
-          return;
-        }
-        if (state.regionExportStatus === 'selecting-region') {
-          state.regionExportSelectionError = 'region-option-unavailable';
-          renderOverlay();
-        }
-      });
-    return true;
-  }
-
   function ensureRegionConfirmingSelection() {
-    if (state.regionExportStatus !== 'selecting-region') return;
-    if (refreshRegionExportSelectionState()) renderOverlay();
+    // No-op in the DHS-native picker: selecting→confirming happens synchronously in
+    // pickCurrentRegionOptionFromOverlay when a leaf 동 is picked. Kept for call-site compatibility.
+    return;
   }
 
   function beginRegionExportSelectionFromOverlay() {
@@ -2795,15 +2869,19 @@
     state.regionExportSelectorReady = false;
     state.regionExportSelectionError = '';
     state.regionExportLastError = '';
+    // DHS-native picker: reset path and load the 시/도 list from Naver's public regions API.
+    // NOTE: we do NOT open Naver's visual selector here — the map must stay still while picking.
+    state.regionPickerPath = [];
+    state.regionPickerOptions = [];
+    state.regionPickerLoading = true;
     renderOverlay();
-    requestCurrentRegionSelectorOpen('sido');
+    loadRegionPickerLevel(REGION_PICKER_TOP_CORTAR_NO, 0);
     return true;
   }
 
   function cancelRegionExportSelection() {
     if (!['selecting-region', 'confirming-region'].includes(state.regionExportStatus)) return false;
-    const trigger = currentRegionSelectorTrigger();
-    if (trigger && currentRegionSelectorExpanded()) fallbackRegionExportClick(trigger);
+    regionPickerLoadToken += 1; // cancel any in-flight level load
     state.regionExportStatus = 'idle';
     state.regionExportSelectionKey = '';
     state.regionExportSelectionLabel = '';
@@ -2812,6 +2890,9 @@
     state.regionExportSelectorWasExpanded = false;
     state.regionExportSelectorReady = false;
     state.regionExportSelectionError = '';
+    state.regionPickerPath = [];
+    state.regionPickerOptions = [];
+    state.regionPickerLoading = false;
     renderOverlay();
     return true;
   }
@@ -2827,14 +2908,14 @@
     // Naver itself (restoreCurrentRegionExportSelection) before collecting, so 추출하기 = "apply the
     // selected region to 네이버부동산 + extract it", which is what the user expects.
     if (!confirmedSelection.complete) {
+      // Shouldn't happen (a confirming-region key is always a complete 3-level pick), but if it does,
+      // drop back into the DHS picker at the 읍/면/동 level rather than driving Naver's selector.
       state.regionExportStatus = 'selecting-region';
       state.regionExportSelectionError = 'selection-changed';
       state.regionExportSelectionKey = '';
       state.regionExportSelectionLabel = '';
       state.regionExportSelectionProof = '';
-      state.regionExportSelectionLevel = 'dong';
-      renderOverlay();
-      requestCurrentRegionSelectorOpen('dong');
+      chooseCurrentRegionLevelFromOverlay('dong');
       return false;
     }
     state.regionExportStatus = 'idle';
@@ -4330,44 +4411,29 @@
       return;
     }
     const api = regionExportSelectionApi();
-    const popupSelection = currentRegionSelectorExpanded() ? currentRegionComplexPopupSelection() : null;
     const confirmedSelection = typeof api.createSelection === 'function'
       ? api.createSelection(String(state.regionExportSelectionKey || '').split('|'))
-      : (popupSelection || currentRegionSelection());
-    const popupComplete = Boolean(popupSelection && popupSelection.complete);
-    const complexListShown = currentRegionSelectorExpanded() && collectCurrentRegionComplexOptions().length > 0;
+      : { complete: false, values: [], key: '' };
     const liveComplete = state.regionExportStatus === 'confirming-region'
-      ? Boolean(confirmedSelection && confirmedSelection.complete)
-      : (popupComplete || complexListShown);
-    const selection = state.regionExportStatus === 'confirming-region'
-      ? confirmedSelection
-      : (popupSelection || currentRegionSelection());
-    const readySelection = state.regionExportStatus === 'confirming-region'
-      ? confirmedSelection
-      : (popupComplete ? popupSelection : currentRegionSelection());
+      && Boolean(confirmedSelection && confirmedSelection.complete);
     flow.classList.toggle('is-confirming', liveComplete);
     const labels = ['\uC2DC/\uB3C4', '\uC2DC/\uAD70/\uAD6C', '\uC74D/\uBA74/\uB3D9'];
-    // Symptom-1 fix: while selecting, freeze the displayed \uC2DC/\uAD6C/\uB3D9 at the FIRST complete (3-part)
-    // pick of this session. The overlay name was live-reading Naver's .area.is-selected each render,
-    // so it churned whenever the map/filter shifted; the snapshot holds the user's chosen region
-    // until they re-open the selector (which resets it).
-    if (
-      state.regionExportStatus === 'selecting-region'
-      && (!Array.isArray(state.regionExportSelectionValues) || state.regionExportSelectionValues.length < 3)
-      && selection && Array.isArray(selection.values) && selection.values.length >= 3
-    ) {
-      state.regionExportSelectionValues = selection.values.slice(0, 3);
-    }
-    const snapshotValues = Array.isArray(state.regionExportSelectionValues) ? state.regionExportSelectionValues : [];
-    const values = (state.regionExportStatus === 'selecting-region' && snapshotValues.length >= 3)
-      ? snapshotValues
-      : (Array.isArray(selection.values) ? selection.values : []);
+    // Step values come straight from the DHS picker path (cortarNames). No live-reading of Naver's map,
+    // so nothing churns while picking.
+    const values = Array.isArray(state.regionExportSelectionValues) ? state.regionExportSelectionValues : [];
+    const activeLevelIndex = Math.min(
+      Array.isArray(state.regionPickerPath) ? state.regionPickerPath.length : 0,
+      REGION_EXPORT_SELECTION_LEVELS.length - 1
+    );
     Array.from(flow.querySelectorAll('.dhs-region-step')).forEach((node, index) => {
       const valueNode = node.querySelector('.dhs-region-step-value');
       if (valueNode) valueNode.textContent = values[index] || labels[index];
       node.classList.toggle('is-selected', Boolean(values[index]));
+      // A step chip is reachable (clickable to re-pick) only up to the current depth.
+      const reachable = index <= (Array.isArray(state.regionPickerPath) ? state.regionPickerPath.length : 0);
+      node.disabled = !reachable;
       node.setAttribute('aria-label', `${labels[index]} ${values[index] || '\uC120\uD0DD'}`);
-      node.setAttribute('aria-pressed', state.regionExportSelectionLevel === REGION_EXPORT_SELECTION_LEVELS[index] ? 'true' : 'false');
+      node.setAttribute('aria-pressed', !liveComplete && index === activeLevelIndex ? 'true' : 'false');
     });
     const title = flow.querySelector('.dhs-region-flow-title');
     const question = flow.querySelector('.dhs-region-question');
@@ -4378,25 +4444,32 @@
       title.textContent = liveComplete ? '\uC120\uD0DD \uC9C0\uC5ED \uD655\uC778' : '\uC9C0\uC5ED \uC120\uD0DD';
     }
     if (question) {
+      const levelPromptLabel = labels[activeLevelIndex] || '';
       question.textContent = liveComplete
-        ? regionExportSelectionConfirmationText(readySelection)
-        : regionExportSelectionErrorText(state.regionExportSelectionError);
+        ? regionExportSelectionConfirmationText(confirmedSelection)
+        : (state.regionExportSelectionError
+          ? regionExportSelectionErrorText(state.regionExportSelectionError)
+          : (state.regionPickerLoading
+            ? '\uBD88\uB7EC\uC624\uB294 \uC911\u2026'
+            : `${levelPromptLabel}\uC744(\uB97C) \uC120\uD0DD\uD558\uC138\uC694`));
     }
     if (optionsNode) {
-      const levelOptions = (!liveComplete && state.regionExportStatus === 'selecting-region')
-        ? collectCurrentRegionLevelOptions()
+      const showOptions = !liveComplete && state.regionExportStatus === 'selecting-region';
+      const levelOptions = showOptions && Array.isArray(state.regionPickerOptions)
+        ? state.regionPickerOptions
         : [];
-      const activeLevelIndex = REGION_EXPORT_SELECTION_LEVELS.indexOf(normalizeRegionSelectionLevel(state.regionExportSelectionLevel));
-      const activeValue = normalizeText(values[activeLevelIndex] || '');
-      optionsNode.hidden = levelOptions.length === 0;
-      optionsNode.innerHTML = levelOptions.map((optionText) => {
-        const isActive = normalizeText(optionText) === activeValue;
-        return '<button type="button" class="dhs-region-option' + (isActive ? ' is-selected' : '') + '" role="option" aria-selected="' + (isActive ? 'true' : 'false') + '" data-dhs-action="pick-region-option" data-dhs-region-option="' + escapeHtml(optionText) + '">' + escapeHtml(optionText) + '</button>';
-      }).join('');
+      optionsNode.hidden = !showOptions || (levelOptions.length === 0 && !state.regionPickerLoading);
+      if (state.regionPickerLoading && showOptions) {
+        optionsNode.innerHTML = '<div class="dhs-region-option is-loading" aria-disabled="true">\uBD88\uB7EC\uC624\uB294 \uC911\u2026</div>';
+      } else {
+        optionsNode.innerHTML = levelOptions.map((option) => {
+          return '<button type="button" class="dhs-region-option" role="option" aria-selected="false" data-dhs-action="pick-region-option" data-dhs-region-cortarno="' + escapeHtml(option.cortarNo) + '">' + escapeHtml(option.cortarName) + '</button>';
+        }).join('');
+      }
     }
     if (choose) {
-      choose.textContent = '\uC9C0\uC5ED \uC120\uD0DD \uCC3D \uC5F4\uAE30';
-      choose.hidden = liveComplete || !state.regionExportSelectionError;
+      // The visual "\uC9C0\uC5ED \uC120\uD0DD \uCC3D \uC5F4\uAE30" fallback is gone \u2014 the DHS picker never opens Naver's selector.
+      choose.hidden = true;
     }
     if (confirm) {
       confirm.textContent = '\uCD94\uCD9C\uD558\uAE30';
@@ -6794,21 +6867,15 @@
         beginRegionExportSelectionFromOverlay();
         return;
       }
-      if (target.getAttribute('data-dhs-action') === 'choose-region') {
-        requestCurrentRegionSelectorOpen(state.regionExportSelectionLevel);
-        return;
-      }
       if (target.getAttribute('data-dhs-action') === 'choose-region-level') {
-        const regionLevel = normalizeRegionSelectionLevel(target.getAttribute('data-dhs-region-level'));
-        requestCurrentRegionSelectorOpen(regionLevel);
+        chooseCurrentRegionLevelFromOverlay(target.getAttribute('data-dhs-region-level'));
         return;
       }
       if (target.getAttribute('data-dhs-action') === 'pick-region-option') {
-        pickCurrentRegionOptionFromOverlay(target.getAttribute('data-dhs-region-option'));
+        pickCurrentRegionOptionFromOverlay(target.getAttribute('data-dhs-region-cortarno'));
         return;
       }
       if (target.getAttribute('data-dhs-action') === 'confirm-region') {
-        ensureRegionConfirmingSelection();
         confirmCurrentRegionExportFromOverlay();
         return;
       }
@@ -12325,21 +12392,8 @@
     listingClickListener = (event) => safeBridgeTask(() => {
       const overlay = document.getElementById(OVERLAY_ID);
       if (overlay && event && event.target && overlay.contains(event.target)) return;
-      const regionOption = regionSelectionOptionFromEventTarget(event && event.target);
-      if (
-        ['selecting-region', 'confirming-region'].includes(state.regionExportStatus)
-        && regionOption
-      ) {
-        if (state.regionExportStatus === 'confirming-region') {
-          state.regionExportStatus = 'selecting-region';
-          state.regionExportSelectionKey = '';
-          state.regionExportSelectionLabel = '';
-          state.regionExportSelectionProof = '';
-          state.regionExportSelectionError = '';
-        }
-        scheduleRegionSelectionUiRefresh(currentRegionVisibleText(regionOption));
-        return;
-      }
+      // DHS-native region picking happens entirely in the card; clicks on Naver's own visual selector
+      // are no longer hijacked into the DHS flow (the picker never opens that popup).
       rememberClickedListingRoot(event && event.target);
       if (recentClickedListingText()) scheduleScan('listing-click');
     });

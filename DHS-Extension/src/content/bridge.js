@@ -12,19 +12,16 @@
   const PROVIDER_DISCOVERY_GRACE_SEC = 3;
   const PROVIDER_DIRECT_LOOKUP_FAST_FALLBACK_MS = 900;
   // A provider direct-lookup that fails for a TRANSIENT reason (rate limit, timeout, http 5xx, tab/
-  // script infra hiccup) is retried a bounded number of times before falling back. This keeps the
-  // result consistent: without it, one transient miss drops the listing from a single exact to the
-  // weaker line-inference multi-candidate fallback, so the same listing resolves differently per run.
-  const PROVIDER_DIRECT_LOOKUP_MAX_RETRY = 2;
-  const PROVIDER_DIRECT_LOOKUP_TRANSIENT_REASONS = [
-    'http-error', 'non-json', 'no-response', 'timeout', 'timed-out', 'aborted',
-    'tab-unavailable', 'tab-create-failed', 'tab-fetch-error', 'script-error', 'script-empty'
-  ];
-  function isTransientProviderLookupFailure(signal) {
-    const value = String(signal || '');
-    if (/^http-(429|5\d\d)$/.test(value)) return true;
-    return PROVIDER_DIRECT_LOOKUP_TRANSIENT_REASONS.includes(value);
-  }
+  // script infra hiccup) is retried a bounded number of times before falling back. Without it, one
+  // transient miss drops the listing from a single exact to the weaker line-inference multi-candidate
+  // fallback, so the same listing resolves differently per run. The predicate + ceiling live in a
+  // pure, unit-tested module (the capture path itself is not CDP-drivable, so its logic is pinned there).
+  const PROVIDER_TRANSIENT = (typeof window !== 'undefined' && window.DHS_PROVIDER_TRANSIENT) || {
+    PROVIDER_DIRECT_LOOKUP_MAX_RETRY: 2,
+    isTransientProviderLookupFailure: function () { return false; }
+  };
+  const PROVIDER_DIRECT_LOOKUP_MAX_RETRY = PROVIDER_TRANSIENT.PROVIDER_DIRECT_LOOKUP_MAX_RETRY;
+  const isTransientProviderLookupFailure = PROVIDER_TRANSIENT.isTransientProviderLookupFailure;
   const PROVIDER_ROUTE_LOOKUP_STALE_CLICK_RESUME_SEC = 8;
   const MAX_PROVIDER_GROUP_CONTEXT_LOOKUPS = 12;
   const ACTIVE_GROUP_ROUTE_MAX_BYTES = 1000000;
@@ -101,7 +98,6 @@
     '\uC11C\uD5A5'
   ]);
   const TOTAL_FLOOR_LABEL_PATTERN = new RegExp(`(?:\\uCD1D|\\uCD5C\\uACE0|\\uC804\\uCCB4)\\s*\\d{1,2}\\s*${FLOOR}`);
-  const DETAIL_TAB_TEXT = '\uB3D9\uD638\uC218/\uACF5\uC2DC\uAC00\uACA9';
   const SELECTED_LISTING_SELECTOR = [
     '.item.is-selected',
     '.item.is-active',
@@ -277,7 +273,6 @@
     investigationStartedAtMs: 0,
     selectedArticleMarkerSource: '',
     representativeChildContextPresent: false,
-    officialTabPresent: false,
     officialRowsPresent: false,
     officialFloorRows: 0,
     officialCandidateCells: 0,
@@ -9267,13 +9262,16 @@
       }
       // Retry the SAME lookup on a transient failure before giving up on it. A genuine no-match
       // ('no-candidate', 'missing-key', ...) is NOT transient and falls through to the normal fallback.
+      // This applies to ALL callers (not just the group-route queue): the `!fallbackStarted` guard
+      // already prevents retrying after the 900ms fast-fallback has opened the provider page, so a
+      // fast transient miss on the primary current-article / provider-name paths is retried too —
+      // that was the path where a one-off 429/5xx silently degraded to the 2-candidate fallback.
       const attempt = Number(settings.attempt || 0);
       const failureSignal = String(
         (response && (response.rejectReason || response.status || response.directLookupStatus)) || 'no-response'
       );
       if (
         !fallbackStarted
-        && settings.fastFallback === false
         && attempt < PROVIDER_DIRECT_LOOKUP_MAX_RETRY
         && isTransientProviderLookupFailure(failureSignal)
       ) {
@@ -11015,7 +11013,9 @@
       groupRouteTargets: groupRouteTargets(),
       // Surface the module-scoped line-map recovery flag so the planner can avoid giving up
       // ('record-no-result') before the line map — which also yields provider/group targets — lands.
-      lineMapRecoveryPending
+      lineMapRecoveryPending,
+      // Same rationale for an in-flight group-route fetch: don't record no-result while it's pending.
+      groupRouteFetchPending: activeGroupRouteFetchCount > 0
     }), {
       nowMs: autoLoopNowMs()
     });
@@ -11039,17 +11039,15 @@
     // (not the complex/URL marker) so it fires only on a real listing change — not every
     // tick when a listing legitimately resolves to a child marker differing from the URL.
     if (urlArticleMarker) lastArticleMarker = urlArticleMarker;
-    // Use textContent (no layout reflow) instead of innerText — this runs on up to a few hundred
-    // buttons/anchors every scan tick; innerText forced a full reflow each time.
-    const officialTabPresent = Array.from(document.querySelectorAll('button, a')).some(
-      (element) => normalizeText(element.textContent) === DETAIL_TAB_TEXT
-    );
     const detailFloor = scanDetailFloor();
     const cdpContextArticleMarker = cdpTargetArticleMarkerForDetail(detailFloor);
     const officialTable = scanOfficialTable(detailFloor);
     const articleApi = window.DHS_ARTICLE_STATE;
+    // hasDetailContext reads only detailFloor; the previous document-wide button/anchor "official tab"
+    // walk (querySelectorAll('button, a') every tick, before the heavy-scan gate) fed an argument that
+    // is ignored and a state.officialTabPresent flag that is read nowhere — removed as dead idle work.
     const detailContextPresent = articleApi && typeof articleApi.hasDetailContext === 'function'
-      ? articleApi.hasDetailContext(detailFloor, officialTabPresent, officialTable)
+      ? articleApi.hasDetailContext(detailFloor)
       : Boolean(detailFloor.detailContextPresent || detailFloor.detailDongToken || (detailFloor.detailFloorKind && detailFloor.detailFloorKind !== 'none'));
     const contextArticleMarker = detailContextArticleMarker(detailFloor);
     const cdpArticleMarker = articleApi && typeof articleApi.resolveVerifiedCdpArticleMarker === 'function'
@@ -11125,7 +11123,6 @@
     state.groupedListingSelectionPending = !regionExportActiveForGate
       && !effectiveDetailPanelPresent
       && groupedSelectionContext;
-    state.officialTabPresent = officialTabPresent;
     state.detailScreenContextPresent = Boolean(activeDetailFloor.detailScreenContextPresent);
     state.detailContextPresent = detailContextPresent;
     state.detailFloorKind = activeDetailFloor.detailFloorKind;
@@ -11152,7 +11149,7 @@
     // the current article is already confirmed-exact latched — nothing to resolve or re-resolve.
     // Skipping never re-derives the latch, so it cannot flip a confirmed result (no 0.1.301 regress).
     const runHeavyScan = (state.detailPanelPresent || regionExportActiveForGate)
-      && !(state.confirmedExactDisplay && state.confirmedExactMarker && state.confirmedExactMarker === state.articleMarker);
+      && !isConfirmedExactLatched();
     if (runHeavyScan) {
     updateGroupFloorHint(activeDetailFloor);
     updateLineInference(activeDetailFloor);
@@ -11724,10 +11721,22 @@
     scheduleScan(scanReason);
   }
 
+  // A trusted single exact is latched for the active listing (same predicate the scanPage heavy-scan
+  // gate uses) — once latched there is nothing left to resolve, so both the heavy scan and this poll
+  // must stop rather than keep re-scanning + waking the service worker on a settled listing.
+  function isConfirmedExactLatched() {
+    return Boolean(
+      state.confirmedExactDisplay
+      && state.confirmedExactMarker
+      && state.confirmedExactMarker === state.articleMarker
+    );
+  }
+
   function pollProviderCandidate() {
     if (!runtimeContextActive) return;
     const articleMarker = activeProviderArticleMarker();
     if (!articleMarker) return;
+    if (isConfirmedExactLatched()) return;
     safeRuntimeSendMessage({
       source: BRIDGE_SOURCE,
       type: 'GET_PROVIDER_CANDIDATE',

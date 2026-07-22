@@ -45,8 +45,12 @@
 
   function unitFloorFromHo(value) {
     const digits = numericToken(value);
-    if (!digits) return 0;
-    return Number(digits.length <= 2 ? digits : digits.slice(0, -2)) || 0;
+    // A 1-2 digit 호 (villa / 연립 / 다세대: "5호", "32호") encodes NO floor — the old code returned the
+    // 호 number itself as the floor (32호 → floor 32), which then fabricated a floor-exact-conflict
+    // against the listing's real floor and DROPPED a correct unit. Abstain (0) so the floor guards
+    // short-circuit and the gate neither rejects nor invents a floor.
+    if (!digits || digits.length < 3) return 0;
+    return Number(digits.slice(0, -2)) || 0;
   }
 
   function exactParts(value) {
@@ -154,7 +158,16 @@
     if (expectedDong && parts.dong && expectedDong !== parts.dong) {
       return buildResult(false, 'dong-mismatch', exact, parts, expectedDong, context);
     }
-    if (context.kind === 'exact' && context.floorValue && parts.floor && context.floorValue !== parts.floor) {
+    if (
+      context.kind === 'exact'
+      && context.floorValue
+      && parts.floor
+      // Only trust the 호-derived floor as a conflict signal when it is plausible for this building.
+      // A floor greater than the total floor count means the derivation is wrong (mis-encoded 호), so
+      // abstain rather than fabricate a conflict that would drop a correct unit.
+      && (!context.totalFloor || parts.floor <= context.totalFloor)
+      && context.floorValue !== parts.floor
+    ) {
       return buildResult(false, 'floor-exact-conflict', exact, parts, expectedDong, context);
     }
     if (context.kind === 'band' && context.floorBand && context.totalFloor && parts.floor) {

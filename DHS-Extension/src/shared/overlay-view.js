@@ -493,10 +493,6 @@
       return buildConfirmedCandidateView(state, confirmedCandidate);
     }
 
-    if (hasAmbiguousProviderCandidates(state)) {
-      return buildAmbiguousProviderCandidateView(state);
-    }
-
     // Active resolution / provider-target views only make sense while a listing's article detail is
     // open (hasSelectedListing = detailPanelPresent). With nothing selected (idle / 단지 정보 / group
     // parent) fall through to the idle view so stale scan state can't render "확인 필요"/"조사 중".
@@ -506,6 +502,14 @@
     // 없음". These flicker and then flip to the real answer, which the user finds misleading.
     if (state && state.investigationInProgress) {
       return buildSelectedRouteView(state, routeSearchStatus(state));
+    }
+    // Genuinely-settled provider ambiguity ("N개 후보") is shown only AFTER the investigationInProgress
+    // gate above — so during active resolution it reads "조사 중", never a candidate count that later
+    // flips to a single "확인 완료". Kept above the line-inference branches (provider evidence is
+    // stronger) and above the mismatch branch (a settled multi-candidate must not be shadowed into
+    // "후보 불일치").
+    if (hasAmbiguousProviderCandidates(state)) {
+      return buildAmbiguousProviderCandidateView(state);
     }
     if (!providerRouteCandidatePending && hasDisplayableSingleEstimatedLineInference(state)) {
       return buildLineInferenceView(state);

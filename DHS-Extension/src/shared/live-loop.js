@@ -405,6 +405,13 @@
     const groupAttempt = nextGroupRouteAttempt(state);
     if (groupAttempt) return groupRouteDecision('group-route-ready', groupAttempt);
     if (Array.isArray(state && state.groupRouteTargets)) {
+      // A group-route fetch is still in flight — recording 'no result' here also clears the provider
+      // candidate mid-fetch (a cross-message-boundary race that can drop an independent candidate).
+      // Wait for it to settle instead. Guarded by !routeSearchExpired so a fetch that never completes
+      // cannot hang the loop.
+      const groupFetchInFlight = (state.groupRouteStatus === 'fetching' || state.groupRouteFetchPending === true)
+        && !routeSearchExpired(state);
+      if (groupFetchInFlight) return baseDecision('waiting', 'wait', 'group-route-fetch-pending');
       return baseDecision('exhausted', 'record-no-result', 'group-routes-exhausted');
     }
     return baseDecision('waiting', 'wait', 'searching-group-routes');

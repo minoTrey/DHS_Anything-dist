@@ -2594,12 +2594,8 @@
     const selectorExpanded = currentRegionSelectorExpanded();
     if (selectorExpanded) state.regionExportSelectorWasExpanded = true;
     if (!state.regionExportSelectorReady) return false;
-    // A complete 시/구/동 pick in the region popup is enough to enable 추출하기. We NO LONGER require
-    // the popup's 단지(complex) list to be populated (`collectCurrentRegionComplexOptions()>0`) — the
-    // extraction run opens + scrolls that list itself (ensureCurrentRegionComplexDropdownOpen), so
-    // forcing the user to view 단지정보 first was needless. We still key off the POPUP selection (the
-    // user's deliberate pick), not the filter's applied region, to avoid confirming the map's current
-    // region the instant the selector opens.
+    const complexListReady = selectorExpanded && collectCurrentRegionComplexOptions().length > 0;
+    if (!complexListReady) return false;
     const popupSelection = currentRegionComplexPopupSelection();
     if (!popupSelection || !popupSelection.complete) return false;
     const selection = popupSelection;

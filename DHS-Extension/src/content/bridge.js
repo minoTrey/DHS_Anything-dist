@@ -22,6 +22,10 @@
   };
   const PROVIDER_DIRECT_LOOKUP_MAX_RETRY = PROVIDER_TRANSIENT.PROVIDER_DIRECT_LOOKUP_MAX_RETRY;
   const isTransientProviderLookupFailure = PROVIDER_TRANSIENT.isTransientProviderLookupFailure;
+  // Same-unit group inheritance decision (pure, unit-tested). Falls back to a no-inherit stub.
+  const GROUP_INHERIT = (typeof window !== 'undefined' && window.DHS_GROUP_INHERIT) || {
+    chooseInheritedExact: function () { return ''; }
+  };
   const PROVIDER_ROUTE_LOOKUP_STALE_CLICK_RESUME_SEC = 8;
   const MAX_PROVIDER_GROUP_CONTEXT_LOOKUPS = 12;
   const ACTIVE_GROUP_ROUTE_MAX_BYTES = 1000000;
@@ -1531,33 +1535,30 @@
   // siblings' articleNos. Empty unless the selection is a grouped child with >=2 members (so a lone
   // listing never shares a key). Used to inherit a sibling's confirmed exact.
   function selectedListingGroupKey() {
-    const roots = selectedListingRoots({ preserveParent: true });
-    for (const root of roots) {
-      if (!root || !(root.closest && root.closest('.item--child'))) continue;
-      const parent = childListingParentRoot(root);
-      if (!parent) continue;
-      const articleNos = childListingRootsForParent(parent)
-        .map((sibling) => articleNoFromListingRoot(sibling))
-        .filter(Boolean)
-        .map((value) => String(value));
-      const unique = Array.from(new Set(articleNos)).sort();
-      if (unique.length >= 2) return unique.join(',');
-    }
-    return '';
+    // Naver's grouped-child DOM carries NO per-child articleNo (href="javascript:void(0)", no data-*),
+    // and the active selection marker sits on `.item_inner.is-selected` / `.area.is-selected`, not on
+    // `.item--child`. The only stable, sibling-IDENTICAL group identity is the expanded group
+    // container `.item.is-expanded` — specifically its representative listing text + broker count,
+    // which is byte-identical no matter which member of the group is currently open.
+    const selected = document.querySelector('.item_inner.is-selected, .area.is-selected');
+    if (!selected || typeof selected.closest !== 'function') return '';
+    const group = selected.closest('.item.is-expanded');
+    if (!group || typeof group.querySelector !== 'function') return '';
+    const groupText = normalizeText(elementText(group));
+    const brokerCount = currentRegionGroupedBrokerCount(groupText);
+    // Only a genuine 동일매물 group (has child rows or a >1 broker count) yields a key.
+    if (!group.querySelector('.item--child') && brokerCount <= 1) return '';
+    // Key off the representative listing's own text (a direct `.item_inner` child of the group) — it
+    // excludes the variable per-child snippets (which flip to "매물을 불러오는 중" until opened), so it
+    // stays constant across sibling opens. Fall back to a bounded group-text prefix if absent.
+    const representative = group.querySelector(':scope > .item_inner');
+    const identity = normalizeText(elementText(representative) || groupText)
+      .replace(/\s+/g, ' ')
+      .slice(0, 200);
+    if (!identity) return '';
+    return `g${brokerCount || 0}:${identity}`;
   }
 
-  // Safety gate for inheriting a group sibling's exact: the inherited 동/호 must be consistent with
-  // THIS child's own line-inference candidate set when one exists (they are the same unit, so the
-  // sibling's answer must appear among this child's candidates). With no candidate set to contradict,
-  // the caller still validates dong/floor via currentListingExactResolution.
-  function groupExactConsistentWithChild(display) {
-    const candidates = Array.isArray(state.lineInferenceCandidateDisplays)
-      ? state.lineInferenceCandidateDisplays
-      : [];
-    if (!candidates.length) return true;
-    const target = normalizeText(display);
-    return candidates.some((candidate) => normalizeText(candidate) === target);
-  }
 
   function expandedListingRootKey(text) {
     return normalizeText(text).replace(/\s+/g, ' ').slice(0, 2000);
@@ -4653,6 +4654,18 @@
   }
 
   function currentListingDongHoResolutionForOverlay() {
+    // A latched confirmed exact — own capture OR inherited from a same-unit (동일매물) group sibling —
+    // is the final answer for this listing. Return it FIRST so the ROW matches the confirmed overlay
+    // view; otherwise this listing's own weaker resolution (e.g. a late line-inference multi-candidate)
+    // would override the confirmed single display via decorateCurrentListingView.
+    if (
+      state.confirmedExactDisplay
+      && state.confirmedExactMarker
+      && state.confirmedExactMarker === normalizeText(state.articleMarker || '')
+    ) {
+      const latched = currentListingExactResolution(state.confirmedExactDisplay);
+      if (latched.dongHoStatus === 'exact') return latched;
+    }
     const cdpFinal = cdpResolverFinalResolutionForOverlay();
     if (cdpFinal) return cdpFinal.dongHoStatus === 'exact'
       ? currentListingExactResolution(cdpFinal.dongHo)
@@ -4849,11 +4862,13 @@
       display = normalizeText(confirmedExactDisplayForSource(source) || '');
     } else if (groupKey) {
       // No own evidence yet — but a sibling of the same 동일매물 group already confirmed the unit.
-      // Inherit it (validated below), so this child shows the answer immediately instead of running
-      // its own slow/sometimes-failing provider search.
-      const inherited = groupExactCache.get(groupKey);
-      if (inherited && inherited.display && groupExactConsistentWithChild(inherited.display)) {
-        display = normalizeText(inherited.display);
+      // Inherit it (validated below via currentListingExactResolution), so this child shows the
+      // answer immediately instead of running its own slow/sometimes-failing provider search.
+      const inheritedDisplay = GROUP_INHERIT.chooseInheritedExact(
+        groupKey, groupExactCache, state.lineInferenceCandidateDisplays
+      );
+      if (inheritedDisplay) {
+        display = inheritedDisplay;
         kind = 'group-inherited';
       }
     }
@@ -7446,6 +7461,9 @@
       lastEvidenceStatus: state.lastEvidenceStatus || '',
       lastEvent: state.lastEvent || '',
       confirmedExactKind: state.confirmedExactKind || '',
+      confirmedExactDisplay: state.confirmedExactDisplay || '',
+      confirmedExactMarker: state.confirmedExactMarker || '',
+      confirmedExactClearedReason: state.confirmedExactClearedReason || '',
       selectedListingGroupKey: state.selectedListingGroupKey || '',
       stop: Boolean(state.stop)
     };

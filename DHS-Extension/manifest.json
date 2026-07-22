@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DHS Anything",
-  "version": "0.1.311",
+  "version": "0.1.312",
   "description": "Redacted diagnostics for Naver Real Estate listing context.",
   "permissions": [
     "alarms",
@@ -118,6 +118,7 @@
         "src/shared/live-loop.js",
         "src/shared/overlay-view.js",
         "src/shared/provider-transient.js",
+        "src/shared/group-inherit.js",
         "src/content/bridge.js"
       ],
       "css": [

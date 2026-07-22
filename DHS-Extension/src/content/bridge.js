@@ -6470,10 +6470,12 @@
     providerRequestGeneration += 1;
     if (state.providerOpenStatus === 'cancelled') state.providerOpenStatus = 'idle';
     renderOverlay();
-    if (
-      regionExportSelectionProofMatches(confirmedSelection)
-      && !currentRegionComplexContextMatchesKey(confirmedSelection.key)
-    ) {
+    // 추출하기: apply the DHS-picked region to 네이버부동산 whenever Naver isn't already on it. The old
+    // `regionExportSelectionProofMatches` gate only restored a "trusted popup selection" (proof
+    // 'selector-complete'); the DHS-native picker sets proof 'dhs-picker', so gating on it skipped the
+    // restore entirely → Naver stayed on the wrong region → checkpoint marker failed → "저장 실패".
+    // The pick came from Naver's own regions API, so the key always maps to a real region to restore.
+    if (!currentRegionComplexContextMatchesKey(confirmedSelection.key)) {
       const restoredSelection = await restoreCurrentRegionExportSelection(confirmedSelection.key, runId);
       if (runId !== regionExportRunId) return;
       if (!restoredSelection.ok) {

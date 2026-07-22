@@ -621,6 +621,10 @@
 
   function confirmedCandidateState(state) {
     const input = state || {};
+    // The confirmed exact belongs to the currently-open listing detail. If no article detail panel is
+    // present (idle / 단지 정보 / a bare group-parent selection whose leftover panel was treated as
+    // stale), the confirmed latch must not keep re-showing the PREVIOUS listing's result.
+    if (!input.detailPanelPresent) return { present: false };
     // A latched confirmed exact (set in bridge once a trusted single exact was confirmed for
     // this listing) wins and is sticky, so late line/group signals cannot re-expand it.
     if (
@@ -762,6 +766,9 @@
 
   function hasAmbiguousGroupCandidates(state) {
     const input = state || {};
+    // Only meaningful for the currently-open listing detail; leftover counts from a previously
+    // investigated listing must not surface after the user moves to a bare group parent (no panel).
+    if (!input.detailPanelPresent) return false;
     return Number(input.groupCandidateCount || 0) > 1
       && (input.groupCandidateRejectedReason === 'ambiguous-candidate' || Boolean(input.groupCandidatePresent));
   }
@@ -770,6 +777,8 @@
     const input = state || {};
     // More than one provider candidate — whether formally rejected as ambiguous, or captured but
     // still not narrowed to a single unit — must show "후보 여러 개", never a single "확인 완료".
+    // Gated on an open detail panel so leftover candidate counts don't leak once the listing closes.
+    if (!input.detailPanelPresent) return false;
     return Number(input.providerCandidateCount || 0) > 1
       && (input.providerCandidateRejectedReason === 'ambiguous-candidate' || Boolean(input.providerCandidatePresent));
   }

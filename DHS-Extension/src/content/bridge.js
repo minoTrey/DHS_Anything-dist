@@ -1514,6 +1514,20 @@
     return false;
   }
 
+  // True when the user's own most recent selection is a BARE group parent (the group header row),
+  // not a specific child. Clicking a parent just expands the 동일매물 cards and opens no detail of its
+  // own — but the PREVIOUS listing's detail panel stays on screen, so detailPanelPresent would read
+  // stale-true and the overlay would keep showing the old listing's result. This lets the gate treat
+  // that leftover panel as stale and idle the overlay. A child selection (inside .item--child) is a
+  // deliberate unit open and must NOT match here.
+  function currentSelectionIsBareGroupParent() {
+    if (lastClickedListingSource !== 'user') return false;
+    const root = recentClickedListingRoot();
+    if (!root) return false;
+    if (root.closest && root.closest('.item--child')) return false;
+    return isGroupedParentListingRoot(root);
+  }
+
   function expandedListingRootKey(text) {
     return normalizeText(text).replace(/\s+/g, ' ').slice(0, 2000);
   }
@@ -11099,12 +11113,17 @@
     // list row. detailScreenContextPresent/detailContextPresent are both contaminated by the
     // selected-listing fallback text, so gate on detailPanelPresent (Boolean(effectiveDetailPanelText)).
     const listingDetailPanelExpanded = Boolean(detailFloor.detailPanelPresent);
-    state.detailPanelPresent = listingDetailPanelExpanded;
+    // A leftover `.detail_contents.is-article` panel from a previously-investigated listing does NOT
+    // close when the user then selects a bare group parent, so it reads stale-true. Treat it as
+    // not-present when the current selection is a bare group parent → the overlay idles instead of
+    // re-showing the old listing's result.
+    const effectiveDetailPanelPresent = listingDetailPanelExpanded && !currentSelectionIsBareGroupParent();
+    state.detailPanelPresent = effectiveDetailPanelPresent;
     const groupedSelectionContext = representativeChildContext
       || selectedArticleMarkerSource === 'representative-child'
       || selectedListingIsGroupedContext();
     state.groupedListingSelectionPending = !regionExportActiveForGate
-      && !listingDetailPanelExpanded
+      && !effectiveDetailPanelPresent
       && groupedSelectionContext;
     state.officialTabPresent = officialTabPresent;
     state.detailScreenContextPresent = Boolean(activeDetailFloor.detailScreenContextPresent);

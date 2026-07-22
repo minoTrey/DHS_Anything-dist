@@ -552,6 +552,9 @@
     regionExportCandidateEarlyExitCount: 0,
     regionExportSelectionKey: '',
     regionExportSelectionLabel: '',
+    // Snapshot of the chosen 시/구/동 values, frozen at the first complete selection of a picking
+    // session so the overlay name doesn't churn as Naver's live filter (.area.is-selected) shifts.
+    regionExportSelectionValues: [],
     regionExportSelectionProof: '',
     regionExportSelectionLevel: 'sido',
     regionExportSelectorWasExpanded: false,
@@ -2584,8 +2587,12 @@
     const selectorExpanded = currentRegionSelectorExpanded();
     if (selectorExpanded) state.regionExportSelectorWasExpanded = true;
     if (!state.regionExportSelectorReady) return false;
-    const complexListReady = selectorExpanded && collectCurrentRegionComplexOptions().length > 0;
-    if (!complexListReady) return false;
+    // A complete 시/구/동 pick in the region popup is enough to enable 추출하기. We NO LONGER require
+    // the popup's 단지(complex) list to be populated (`collectCurrentRegionComplexOptions()>0`) — the
+    // extraction run opens + scrolls that list itself (ensureCurrentRegionComplexDropdownOpen), so
+    // forcing the user to view 단지정보 first was needless. We still key off the POPUP selection (the
+    // user's deliberate pick), not the filter's applied region, to avoid confirming the map's current
+    // region the instant the selector opens.
     const popupSelection = currentRegionComplexPopupSelection();
     if (!popupSelection || !popupSelection.complete) return false;
     const selection = popupSelection;
@@ -2635,6 +2642,7 @@
     state.regionExportStatus = 'selecting-region';
     state.regionExportSelectionKey = '';
     state.regionExportSelectionLabel = '';
+    state.regionExportSelectionValues = [];
     state.regionExportSelectionProof = '';
     state.regionExportSelectorWasExpanded = false;
     state.regionExportSelectorReady = false;
@@ -2777,6 +2785,7 @@
     state.regionExportStatus = 'selecting-region';
     state.regionExportSelectionKey = '';
     state.regionExportSelectionLabel = '';
+    state.regionExportSelectionValues = [];
     state.regionExportSelectionProof = '';
     state.regionExportSelectionLevel = 'sido';
     state.regionExportSelectorWasExpanded = false;
@@ -4334,7 +4343,21 @@
       : (popupComplete ? popupSelection : currentRegionSelection());
     flow.classList.toggle('is-confirming', liveComplete);
     const labels = ['\uC2DC/\uB3C4', '\uC2DC/\uAD70/\uAD6C', '\uC74D/\uBA74/\uB3D9'];
-    const values = Array.isArray(selection.values) ? selection.values : [];
+    // Symptom-1 fix: while selecting, freeze the displayed \uC2DC/\uAD6C/\uB3D9 at the FIRST complete (3-part)
+    // pick of this session. The overlay name was live-reading Naver's .area.is-selected each render,
+    // so it churned whenever the map/filter shifted; the snapshot holds the user's chosen region
+    // until they re-open the selector (which resets it).
+    if (
+      state.regionExportStatus === 'selecting-region'
+      && (!Array.isArray(state.regionExportSelectionValues) || state.regionExportSelectionValues.length < 3)
+      && selection && Array.isArray(selection.values) && selection.values.length >= 3
+    ) {
+      state.regionExportSelectionValues = selection.values.slice(0, 3);
+    }
+    const snapshotValues = Array.isArray(state.regionExportSelectionValues) ? state.regionExportSelectionValues : [];
+    const values = (state.regionExportStatus === 'selecting-region' && snapshotValues.length >= 3)
+      ? snapshotValues
+      : (Array.isArray(selection.values) ? selection.values : []);
     Array.from(flow.querySelectorAll('.dhs-region-step')).forEach((node, index) => {
       const valueNode = node.querySelector('.dhs-region-step-value');
       if (valueNode) valueNode.textContent = values[index] || labels[index];

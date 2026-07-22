@@ -4106,12 +4106,12 @@
     ];
   }
 
-  function regionExportSimpleRowsForOverlay(row) {
+  function regionExportSimpleRowsForOverlay(row, options) {
     const simpleRow = regionExportSimpleRow(row, row && row.collectedAt || '');
     const displayRows = REGION_EXPORT_SIMPLE_HEADERS
       .map((label, index) => ({ label, value: simpleRow[index] || '' }))
       .filter((item) => normalizeText(item.value));
-    const processingRows = regionExportProcessingRowsForOverlay(row);
+    const processingRows = regionExportProcessingRowsForOverlay(row, options);
     if (!processingRows.length) return displayRows;
     const collectedIndex = displayRows.findIndex((item) => item.label === '\uC218\uC9D1\uC2DC\uAC04');
     if (collectedIndex < 0) return displayRows.concat(processingRows);
@@ -4140,13 +4140,18 @@
     return remain ? `${minutes}\uBD84 ${remain}\uCD08` : `${minutes}\uBD84`;
   }
 
-  function regionExportProcessingRowsForOverlay(row) {
+  function regionExportProcessingRowsForOverlay(row, options) {
     const safe = row || {};
     const rows = [];
     const status = regionExportProcessingStatusForOverlay(safe);
-    const elapsed = regionExportDurationForOverlay(safe.routeSearchElapsedSec);
     if (status) rows.push({ label: '\uCC98\uB9AC\uC0C1\uD0DC', value: status });
-    if (elapsed) rows.push({ label: '\uAC78\uB9B0\uC2DC\uAC04', value: elapsed });
+    // The current-listing overlay suppresses the baked \uAC78\uB9B0\uC2DC\uAC04 (options.suppressElapsed) so it does
+    // NOT bake the live-ticking elapsed into excelRows \u2014 the overlay-view gate then adds it only once
+    // a confirmed exact is latched (frozen). Region-export rows keep it (batch progress).
+    if (!(options && options.suppressElapsed)) {
+      const elapsed = regionExportDurationForOverlay(safe.routeSearchElapsedSec);
+      if (elapsed) rows.push({ label: '\uAC78\uB9B0\uC2DC\uAC04', value: elapsed });
+    }
     return rows;
   }
 
@@ -5017,7 +5022,9 @@
     };
     const cleaned = stripRegionExportRow(row);
     return Object.assign({}, cleaned, {
-      excelRows: regionExportSimpleRowsForOverlay(cleaned)
+      // Suppress the baked live-ticking 걸린시간 for the current-listing overlay; overlay-view adds it
+      // (frozen) only once a confirmed exact is latched, so the processing overlay stays static.
+      excelRows: regionExportSimpleRowsForOverlay(cleaned, { suppressElapsed: true })
     });
   }
 

@@ -376,11 +376,16 @@
       && Number.isFinite(Number(input.routeSearchElapsedSec));
     if (!hasRouteStatus && !hasElapsed) return output;
     upsertSummaryRow(output, '\uCC98\uB9AC\uC0C1\uD0DC', currentListingProcessingValue(input, row));
-    if (hasElapsed) {
-      const elapsedSeconds = terminal && hasRowElapsed
-        ? sourceRow.routeSearchElapsedSec
-        : input.routeSearchElapsedSec;
-      upsertSummaryRow(output, '\uAC78\uB9B0\uC2DC\uAC04', formatDuration(elapsedSeconds));
+    // Render \uAC78\uB9B0\uC2DC\uAC04 ONLY once a confirmed exact is latched for this listing \u2014 the single stable,
+    // frozen "done" signal. Every row/displaySettled-based gate was defeated because those states
+    // oscillate (waiting\u2194multiple-candidates) while the loop retries, so elapsed flickered on and
+    // ticked via the live value. The confirmed-exact latch is set once and held, so gating on it (and
+    // using the frozen per-row elapsed) means \uAC78\uB9B0\uC2DC\uAC04 appears exactly at \uB3D9\uD638\uC218 \uD655\uC815 and never ticks \u2014
+    // the processing overlay stays static, no per-second DOM/probe churn.
+    const confirmedSettled = Boolean(input && input.confirmedExactMarker
+      && input.confirmedExactMarker === input.articleMarker);
+    if (confirmedSettled && hasRowElapsed) {
+      upsertSummaryRow(output, '\uAC78\uB9B0\uC2DC\uAC04', formatDuration(sourceRow.routeSearchElapsedSec));
     }
     return output;
   }

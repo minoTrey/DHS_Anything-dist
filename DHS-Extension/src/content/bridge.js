@@ -225,6 +225,8 @@
   }
   const staleOverlay = document.getElementById(OVERLAY_ID);
   if (staleOverlay) staleOverlay.remove();
+  const staleRegionShield = document.getElementById('dhs-region-export-shield');
+  if (staleRegionShield) staleRegionShield.remove();
   window.__DHS_ANYTHING_CHROME_BRIDGE__ = VERSION;
   window.__DHS_ANYTHING_CHROME_BRIDGE_SESSION__ = runtimeSession;
 
@@ -642,6 +644,9 @@
   let compareSignalDisplay = '';
   let compareSignalHash = '';
   let compareSignalPending = '';
+  // While >0, the region-export shield is click-through (pointer-events:none) so the extraction's own
+  // coordinate-based trusted clicks can land on the page; otherwise the shield blocks user clicks.
+  let regionExportShieldClickThroughDepth = 0;
   let regionExportRunId = 0;
   let regionExportMarkerNoncePromise = null;
   let regionExportResumeRegionKey = '';
@@ -830,6 +835,8 @@
     stopRuntimeTasks();
     const overlay = document.getElementById(OVERLAY_ID);
     if (overlay) overlay.remove();
+    const shield = document.getElementById('dhs-region-export-shield');
+    if (shield) shield.remove();
   };
 
   function safeBridgeTask(fn) {
@@ -5089,6 +5096,8 @@
         resolve(clicked);
         return;
       }
+      // Let the extraction's own coordinate click pass through the shield, then restore the block.
+      const restoreShield = beginRegionExportShieldClickThrough();
       safeRuntimeSendMessage({
         source: BRIDGE_SOURCE,
         type: 'DISPATCH_PROVIDER_CLICK',
@@ -5097,6 +5106,7 @@
         y: point.y,
         returnFocusDelayMs: 250
       }, (response) => {
+        restoreShield();
         if (expectedRunId && expectedRunId !== regionExportRunId) {
           resolve(false);
           return;
@@ -6642,6 +6652,97 @@
     return api.kbAliasEvidenceFromUrl(location.href);
   }
 
+  const REGION_EXPORT_SHIELD_ID = 'dhs-region-export-shield';
+
+  function regionExportShieldActive() {
+    return ['preparing', 'running', 'saving'].includes(state.regionExportStatus);
+  }
+
+  function ensureRegionExportShield() {
+    let shield = document.getElementById(REGION_EXPORT_SHIELD_ID);
+    if (shield) return shield;
+    if (!document.documentElement) return null;
+    shield = document.createElement('div');
+    shield.id = REGION_EXPORT_SHIELD_ID;
+    shield.setAttribute('role', 'alertdialog');
+    shield.setAttribute('aria-label', '지역 추출 진행 중');
+    shield.style.cssText = [
+      'position:fixed', 'inset:0', 'z-index:2147483646', 'display:none',
+      'align-items:center', 'justify-content:center',
+      'background:rgba(15,23,42,0.45)', 'pointer-events:auto', 'cursor:not-allowed'
+    ].join(';');
+    const box = document.createElement('div');
+    box.style.cssText = [
+      'pointer-events:auto', 'max-width:320px', 'text-align:center', 'background:#0f172a',
+      'color:#e2e8f0', 'border-radius:14px', 'padding:18px 22px',
+      'box-shadow:0 12px 44px rgba(0,0,0,0.45)',
+      'font:600 14px/1.55 -apple-system,BlinkMacSystemFont,"Malgun Gothic",sans-serif'
+    ].join(';');
+    const msg = document.createElement('div');
+    msg.textContent = '지역 추출 중입니다. 완료될 때까지 페이지를 건드리지 마세요.';
+    const sub = document.createElement('div');
+    sub.className = 'dhs-region-shield-sub';
+    sub.style.cssText = 'margin-top:6px;font-weight:400;font-size:12px;color:#94a3b8';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'dhs-region-shield-cancel';
+    cancel.textContent = '추출 취소';
+    cancel.style.cssText = [
+      'margin-top:14px', 'pointer-events:auto', 'cursor:pointer', 'background:#ef4444',
+      'color:#fff', 'border:0', 'border-radius:8px', 'padding:8px 16px', 'font:600 13px sans-serif'
+    ].join(';');
+    cancel.addEventListener('click', (event) => {
+      if (event) event.stopPropagation();
+      safeBridgeTask(() => {
+        if (cancelCurrentRegionExport()) renderOverlay();
+      });
+    });
+    box.appendChild(msg);
+    box.appendChild(sub);
+    box.appendChild(cancel);
+    shield.appendChild(box);
+    document.documentElement.appendChild(shield);
+    return shield;
+  }
+
+  function updateRegionExportShield() {
+    const active = regionExportShieldActive();
+    const shield = active ? ensureRegionExportShield() : document.getElementById(REGION_EXPORT_SHIELD_ID);
+    if (!shield) return;
+    if (!active) {
+      if (shield.style.display !== 'none') shield.style.display = 'none';
+      return;
+    }
+    if (shield.style.display !== 'flex') shield.style.display = 'flex';
+    const clickThrough = regionExportShieldClickThroughDepth > 0 ? 'none' : 'auto';
+    if (shield.style.pointerEvents !== clickThrough) shield.style.pointerEvents = clickThrough;
+    const sub = shield.querySelector('.dhs-region-shield-sub');
+    if (sub) {
+      const label = state.regionExportStatus === 'saving'
+        ? '저장 중…'
+        : (state.regionExportStatus === 'preparing'
+          ? '준비 중…'
+          : `진행 ${Number(state.regionExportDoneCount || 0)}/${Number(state.regionExportRowCount || 0)}`);
+      if (sub.textContent !== label) sub.textContent = label;
+    }
+  }
+
+  // Toggle the shield to click-through so the extraction's own coordinate clicks reach the page, then
+  // restore. A safety timer guarantees the block is restored even if the click callback never fires.
+  function beginRegionExportShieldClickThrough() {
+    regionExportShieldClickThroughDepth += 1;
+    updateRegionExportShield();
+    let restored = false;
+    const restore = () => {
+      if (restored) return;
+      restored = true;
+      regionExportShieldClickThroughDepth = Math.max(0, regionExportShieldClickThroughDepth - 1);
+      updateRegionExportShield();
+    };
+    window.setTimeout(restore, 1500);
+    return restore;
+  }
+
   function ensureOverlay() {
     let overlay = document.getElementById(OVERLAY_ID);
     if (overlay) return overlay;
@@ -6734,6 +6835,8 @@
   function renderOverlay() {
     const overlay = ensureOverlay();
     if (!overlay) return;
+    // Full-screen shield blocks page interaction while an extraction is preparing/running/saving.
+    updateRegionExportShield();
     const currentListingOverlayRow = currentListingOverlayRowForOverlay();
     writeOverlayProbeDataset(overlay, currentListingOverlayRow);
 

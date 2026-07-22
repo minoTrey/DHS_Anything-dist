@@ -2822,10 +2822,11 @@
     const confirmedSelection = typeof api.createSelection === 'function'
       ? api.createSelection(String(state.regionExportSelectionKey || '').split('|'))
       : { complete: false, key: '' };
-    if (
-      !confirmedSelection.complete
-      || !currentRegionExportSelectionMatches(confirmedSelection)
-    ) {
+    // 추출하기: proceed on ANY complete 시/구/동 selection. We no longer bail when Naver's currently
+    // applied region has drifted from the pick — the extraction run APPLIES the confirmed region to
+    // Naver itself (restoreCurrentRegionExportSelection) before collecting, so 추출하기 = "apply the
+    // selected region to 네이버부동산 + extract it", which is what the user expects.
+    if (!confirmedSelection.complete) {
       state.regionExportStatus = 'selecting-region';
       state.regionExportSelectionError = 'selection-changed';
       state.regionExportSelectionKey = '';
@@ -6309,12 +6310,10 @@
       renderOverlay();
       return;
     }
-    if (!currentRegionExportSelectionMatches(confirmedSelection)) {
-      state.regionExportStatus = 'error';
-      state.regionExportLastError = 'selection-changed';
-      renderOverlay();
-      return;
-    }
+    // Do NOT bail when Naver's currently applied region differs from the confirmed pick — the run
+    // applies (restores) the confirmed region to 네이버부동산 before collecting complexes. 추출하기
+    // therefore navigates Naver to the selected region and extracts it, rather than requiring Naver to
+    // already be on it.
     if (!lockHeld) {
       const resumeRegionKey = state.regionExportStatus === 'cancelled'
         && state.regionExportLastError === 'user-cancelled'
@@ -7594,6 +7593,10 @@
       confirmedExactMarker: state.confirmedExactMarker || '',
       confirmedExactClearedReason: state.confirmedExactClearedReason || '',
       selectedListingGroupKey: state.selectedListingGroupKey || '',
+      regionExportStatus: state.regionExportStatus || '',
+      regionExportSelectionError: state.regionExportSelectionError || '',
+      regionExportLastError: state.regionExportLastError || '',
+      regionExportSelectorReady: Boolean(state.regionExportSelectorReady),
       stop: Boolean(state.stop)
     };
     // R4: only touch the DOM attribute when the serialized probe actually changed. This avoids an

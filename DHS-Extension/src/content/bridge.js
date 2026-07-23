@@ -6509,19 +6509,41 @@
         renderOverlay();
         return;
       }
-      let lockAcquired = false;
-      await navigator.locks.request(REGION_EXPORT_BROWSER_LOCK_NAME, {
-        mode: 'exclusive',
-        ifAvailable: true
-      }, async (lock) => {
-        if (!lock) return;
-        lockAcquired = true;
+      // The cross-tab lock is best-effort, NOT a hard gate. A previous run that was killed mid-flight
+      // (e.g. an auto-update reload) can leave this lock stuck held by a hung promise; a plain
+      // ifAvailable check would then fail EVERY subsequent 추출하기 instantly with "another-tab-running".
+      // Instead: try to grab it, wait briefly if held, and if it's still not free just PROCEED without it
+      // (a single user almost never runs two exports at once, and the run is run-id fenced anyway).
+      let ranExport = false;
+      const runUnderLock = async (lock) => {
+        if (ranExport) return;
+        ranExport = true;
         await exportCurrentRegionFromOverlay(true, confirmedSelection.key, resumeRegionKey);
-      });
-      if (!lockAcquired) {
-        state.regionExportStatus = 'error';
-        state.regionExportLastError = 'another-tab-running';
-        renderOverlay();
+      };
+      const timeoutSignal = (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function')
+        ? AbortSignal.timeout(2500)
+        : null;
+      try {
+        if (timeoutSignal) {
+          await navigator.locks.request(
+            REGION_EXPORT_BROWSER_LOCK_NAME,
+            { mode: 'exclusive', signal: timeoutSignal },
+            runUnderLock
+          );
+        } else {
+          await navigator.locks.request(
+            REGION_EXPORT_BROWSER_LOCK_NAME,
+            { mode: 'exclusive', ifAvailable: true },
+            async (lock) => { if (lock) await runUnderLock(lock); }
+          );
+        }
+      } catch (error) {
+        if (isRuntimeInvalidationError(error)) { markRuntimeUnavailable(error); return; }
+        // lock wait aborted (held too long by a stuck/other run) — fall through to best-effort below
+      }
+      if (!ranExport) {
+        // Lock was unavailable; run anyway rather than blocking the user with "another-tab-running".
+        await exportCurrentRegionFromOverlay(true, confirmedSelection.key, resumeRegionKey);
       }
       return;
     }

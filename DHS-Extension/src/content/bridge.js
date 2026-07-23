@@ -5276,7 +5276,10 @@
         version: VERSION,
         x: point.x,
         y: point.y,
-        returnFocusDelayMs: 250
+        // Region export runs unattended in the background — the CDP click lands on the tab whether or not
+        // it's active, so DON'T re-activate (focus) the Naver tab after each click. returnFocusDelayMs:0
+        // makes the SW skip the tab activation that was yanking focus back to 부동산 mid-extraction.
+        returnFocusDelayMs: 0
       }, (response) => {
         restoreShield();
         if (expectedRunId && expectedRunId !== regionExportRunId) {
@@ -10224,7 +10227,10 @@
       articleMarker: state.articleMarker,
       x: point.x,
       y: point.y,
-      returnFocusDelayMs: 2500
+      // While a region export runs unattended, don't re-activate (focus) the Naver tab after provider
+      // clicks — that was stealing focus back to 부동산 while the user worked elsewhere. Interactive
+      // single-listing investigation keeps the focus-return so provider popups don't leave the user adrift.
+      returnFocusDelayMs: regionExportShieldActive() ? 0 : 2500
     }, (response) => {
       if (response && response.ok) {
         markProviderClickStarted('trusted-clicked', phase, result);

@@ -2448,6 +2448,25 @@
       .find((element) => currentRegionVisibleText(element).includes('\uB2E8\uC9C0')) || null;
   }
 
+  // The topmost element at (x,y) that is NOT part of DHS's own UI. During a region export the shield
+  // (position:fixed; inset:0; z-index max; pointer-events:auto) covers the whole viewport, so a naive
+  // elementFromPoint would return the shield and make every page element look "occluded" — that self-
+  // inflicted block was the real cause of complex-detail-close-unavailable / 저장 실패. Our overlay and
+  // shield must be transparent to hit-testing.
+  function topmostNonDhsElementAtPoint(x, y) {
+    const stack = typeof document.elementsFromPoint === 'function'
+      ? document.elementsFromPoint(x, y)
+      : [document.elementFromPoint(x, y)];
+    for (const element of stack) {
+      if (!element) continue;
+      if (element.id === OVERLAY_ID || element.id === REGION_EXPORT_SHIELD_ID) continue;
+      if (typeof element.closest === 'function'
+        && element.closest(`#${OVERLAY_ID}, #${REGION_EXPORT_SHIELD_ID}`)) continue;
+      return element;
+    }
+    return null;
+  }
+
   function currentRegionComplexTriggerIsClickable(trigger) {
     if (!trigger || !isVisibleNode(trigger) || typeof trigger.getBoundingClientRect !== 'function') return false;
     const rect = trigger.getBoundingClientRect();
@@ -2455,7 +2474,7 @@
     const x = rect.left + rect.width / 2;
     const y = rect.top + rect.height / 2;
     if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) return false;
-    const hit = document.elementFromPoint(x, y);
+    const hit = topmostNonDhsElementAtPoint(x, y);
     if (!hit) return false;
     return hit === trigger
       || (typeof trigger.contains === 'function' && trigger.contains(hit))

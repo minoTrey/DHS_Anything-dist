@@ -4356,7 +4356,7 @@
     };
   }
 
-  async function downloadRegionExportWorkbook(filename, xlsxBase64) {
+  function downloadRegionExportWorkbook(payload) {
     return new Promise((resolve, reject) => {
       let settled = false;
       const finish = (error, value) => {
@@ -4369,12 +4369,10 @@
       const timeoutId = window.setTimeout(() => {
         finish(new Error('region-export-download-timeout'));
       }, 15000);
-      const sent = safeRuntimeSendMessage({
+      const sent = safeRuntimeSendMessage(Object.assign({
         source: BRIDGE_SOURCE,
-        type: 'DOWNLOAD_REGION_EXPORT',
-        filename,
-        xlsxBase64
-      }, (response) => {
+        type: 'DOWNLOAD_REGION_EXPORT'
+      }, payload && typeof payload === 'object' ? payload : {}), (response) => {
         if (!response || response.ok !== true) {
           finish(new Error(String(response && response.reason || 'region-export-download-failed')));
           return;
@@ -4386,6 +4384,25 @@
       });
       if (!sent) finish(new Error('region-export-download-unavailable'));
     });
+  }
+
+  // Save the cleaned rows as .xlsx, ALWAYS carrying the CSV equivalent as a fallback so the SW can retry
+  // as .csv if the .xlsx download fails or the xlsx writer was unavailable — the user never hits a bare
+  // "저장 실패" with no file. baseName has no extension; the SW picks .xlsx or the .csv fallback name.
+  async function saveRegionExportWorkbook(baseName, grid, csvText) {
+    const safeCsv = typeof csvText === 'string' ? csvText : '';
+    let xlsxBase64 = '';
+    try { xlsxBase64 = buildRegionExportXlsxBase64(grid); } catch (_) { xlsxBase64 = ''; }
+    if (xlsxBase64) {
+      return downloadRegionExportWorkbook({
+        filename: `${baseName}.xlsx`,
+        xlsxBase64,
+        csvText: safeCsv,
+        filenameFallback: `${baseName}.csv`
+      });
+    }
+    // xlsx writer unavailable (partial/stale extension load) — save CSV rather than fail.
+    return downloadRegionExportWorkbook({ filename: `${baseName}.csv`, csvText: safeCsv });
   }
 
   function regionExportElapsedMilliseconds() {
@@ -6493,7 +6510,7 @@
       : '';
     const runId = regionExportRunId + 1;
     regionExportRunId = runId;
-    const filename = `dhs-region-${currentTimestampForFilename()}.xlsx`;
+    const baseName = `dhs-region-${currentTimestampForFilename()}`;
     state.lastEvent = 'region-export';
     state.regionExportStatus = 'preparing';
     state.regionExportRowCount = 0;
@@ -6606,7 +6623,7 @@
       state.regionExportLastError = errorMessage;
       if (!beginRegionExportFileWrite(runId)) return;
       try {
-        await downloadRegionExportWorkbook(filename, buildRegionExportXlsxBase64(regionExportStatusRows2D('error', errorMessage)));
+        await saveRegionExportWorkbook(baseName, regionExportStatusRows2D('error', errorMessage), buildRegionExportStatusCsv('error', errorMessage));
       } catch (writeError) {
         state.regionExportLastError = String(writeError && writeError.message || writeError || errorMessage || '').slice(0, 120);
       }
@@ -6624,7 +6641,7 @@
       if (!beginRegionExportFileWrite(runId)) return;
       let finalStatus = 'no-rows';
       try {
-        await downloadRegionExportWorkbook(filename, buildRegionExportXlsxBase64(regionExportStatusRows2D('no-rows', 'no listing rows collected')));
+        await saveRegionExportWorkbook(baseName, regionExportStatusRows2D('no-rows', 'no listing rows collected'), buildRegionExportStatusCsv('no-rows', 'no listing rows collected'));
       } catch (error) {
         finalStatus = 'error';
         state.regionExportLastError = String(error && error.message || error || '').slice(0, 120);
@@ -6643,9 +6660,10 @@
       if (!beginRegionExportFileWrite(runId)) return;
       let finalStatus = 'quality-blocked';
       try {
-        await downloadRegionExportWorkbook(
-          filename,
-          buildRegionExportXlsxBase64(regionExportStatusRows2D('grouped-retry-pending', message))
+        await saveRegionExportWorkbook(
+          baseName,
+          regionExportStatusRows2D('grouped-retry-pending', message),
+          buildRegionExportStatusCsv('grouped-retry-pending', message)
         );
       } catch (error) {
         finalStatus = 'error';
@@ -6664,7 +6682,7 @@
       if (!beginRegionExportFileWrite(runId)) return;
       let finalStatus = 'quality-blocked';
       try {
-        await downloadRegionExportWorkbook(filename, buildRegionExportXlsxBase64(regionExportStatusRows2D('quality-blocked', quality.message)));
+        await saveRegionExportWorkbook(baseName, regionExportStatusRows2D('quality-blocked', quality.message), buildRegionExportStatusCsv('quality-blocked', quality.message));
       } catch (error) {
         finalStatus = 'error';
         state.regionExportLastError = String(error && error.message || error || '').slice(0, 120);
@@ -6677,13 +6695,13 @@
     }
     if (!beginRegionExportFileWrite(runId)) return;
     try {
-      const download = await downloadRegionExportWorkbook(filename, buildRegionExportXlsxBase64(regionExportRows2D(rows)));
+      const download = await saveRegionExportWorkbook(baseName, regionExportRows2D(rows), buildCurrentRegionCsv(rows));
       if (runId !== regionExportRunId) return;
       const checkpointCleared = await clearRegionExportCheckpoint(regionKey);
       if (runId !== regionExportRunId) return;
       if (!checkpointCleared) throw new Error('checkpoint-cleanup-failed');
       state.regionExportStatus = 'downloaded';
-      state.regionExportSavedPath = download.path || `Downloads/DHS/${filename}`;
+      state.regionExportSavedPath = download.path || `Downloads/DHS/${baseName}.xlsx`;
       regionExportResumeRegionKey = '';
     } catch (error) {
       if (runId !== regionExportRunId) return;

@@ -5,7 +5,7 @@ importScripts('../shared/mk-provider-lookup.js');
 importScripts('../shared/naver-line-map.js');
 importScripts('../shared/building-units-resolver.js');
 
-globalThis.__DHS_SERVICE_WORKER_VERSION__ = '0.1.321';
+globalThis.__DHS_SERVICE_WORKER_VERSION__ = '0.1.322';
 const PROVIDER_SOURCE = 'DHS_ANYTHING_PROVIDER_CAPTURE';
 const BRIDGE_SOURCE = 'DHS_ANYTHING_CHROME_BRIDGE';
 const DEBUGGER_PROTOCOL_VERSION = '1.3';
@@ -1497,56 +1497,68 @@ function downloadRegionExportCsv(data, sender, sendResponse) {
     sendResponse({ ok: false, reason: 'untrusted-sender' });
     return false;
   }
-  const filename = sanitizeRegionExportFilename(data && data.filename);
-  // The cleaned workbook is delivered as base64-encoded .xlsx bytes (real spreadsheet columns); legacy
-  // csvText is still accepted for compatibility. Build the right data: URL for whichever is present.
-  const xlsxBase64 = typeof (data && data.xlsxBase64) === 'string' ? data.xlsxBase64 : '';
-  const csvText = typeof (data && data.csvText) === 'string' ? data.csvText : '';
-  let url = '';
-  if (xlsxBase64) {
-    const approxBytes = Math.floor(xlsxBase64.length * 3 / 4);
-    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(xlsxBase64) || approxBytes > REGION_EXPORT_MAX_CSV_BYTES) {
-      sendResponse({ ok: false, reason: 'invalid-xlsx-size' });
-      return false;
-    }
-    url = `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${xlsxBase64}`;
-  } else {
-    const byteLength = new TextEncoder().encode(csvText).byteLength;
-    if (!csvText || byteLength > REGION_EXPORT_MAX_CSV_BYTES) {
-      sendResponse({ ok: false, reason: 'invalid-csv-size' });
-      return false;
-    }
-    url = `data:text/csv;charset=utf-8,${encodeURIComponent(csvText)}`;
-  }
-  if (!filename) {
-    sendResponse({ ok: false, reason: 'invalid-filename' });
-    return false;
-  }
   if (!chrome.downloads || typeof chrome.downloads.download !== 'function') {
     sendResponse({ ok: false, reason: 'downloads-unavailable' });
     return false;
   }
-  try {
-    chrome.downloads.download({
-      url,
-      filename: `DHS/${filename}`,
-      saveAs: false,
-      conflictAction: 'uniquify'
-    }, (downloadId) => {
-      const runtimeError = chrome.runtime.lastError;
-      if (runtimeError || !Number.isInteger(downloadId)) {
-        sendResponse({ ok: false, reason: 'download-failed' });
+  const filename = sanitizeRegionExportFilename(data && data.filename);
+  const filenameFallback = sanitizeRegionExportFilename(data && data.filenameFallback);
+  // The cleaned workbook ships as base64-encoded .xlsx bytes (real spreadsheet columns). A CSV payload is
+  // ALWAYS carried alongside as a fallback so a failed .xlsx download NEVER produces "저장 실패" with no
+  // file — we retry the same data as CSV. This also keeps working if the .xlsx writer was unavailable.
+  const xlsxBase64 = typeof (data && data.xlsxBase64) === 'string' ? data.xlsxBase64 : '';
+  const csvText = typeof (data && data.csvText) === 'string' ? data.csvText : '';
+  const xlsxOk = Boolean(
+    xlsxBase64
+    && filename
+    && /\.xlsx$/.test(filename)
+    && /^[A-Za-z0-9+/]*={0,2}$/.test(xlsxBase64)
+    && Math.floor(xlsxBase64.length * 3 / 4) <= REGION_EXPORT_MAX_CSV_BYTES
+  );
+  const csvName = filenameFallback || (filename && /\.csv$/.test(filename) ? filename : '');
+  const csvOk = Boolean(
+    csvText
+    && csvName
+    && new TextEncoder().encode(csvText).byteLength <= REGION_EXPORT_MAX_CSV_BYTES
+  );
+  if (!xlsxOk && !csvOk) {
+    sendResponse({ ok: false, reason: !filename && !csvName ? 'invalid-filename' : 'invalid-payload' });
+    return false;
+  }
+  const tryDownload = (url, name) => new Promise((resolve) => {
+    try {
+      chrome.downloads.download({
+        url,
+        filename: `DHS/${name}`,
+        saveAs: false,
+        conflictAction: 'uniquify'
+      }, (downloadId) => {
+        resolve(chrome.runtime.lastError || !Number.isInteger(downloadId) ? null : downloadId);
+      });
+    } catch (_) {
+      resolve(null);
+    }
+  });
+  (async () => {
+    if (xlsxOk) {
+      const id = await tryDownload(
+        `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${xlsxBase64}`,
+        filename
+      );
+      if (id !== null) {
+        sendResponse({ ok: true, downloadId: id, path: `Downloads/DHS/${filename}` });
         return;
       }
-      sendResponse({
-        ok: true,
-        downloadId,
-        path: `Downloads/DHS/${filename}`
-      });
-    });
-  } catch (_) {
+    }
+    if (csvOk) {
+      const id = await tryDownload(`data:text/csv;charset=utf-8,${encodeURIComponent(csvText)}`, csvName);
+      if (id !== null) {
+        sendResponse({ ok: true, downloadId: id, path: `Downloads/DHS/${csvName}` });
+        return;
+      }
+    }
     sendResponse({ ok: false, reason: 'download-failed' });
-  }
+  })();
   return true;
 }
 

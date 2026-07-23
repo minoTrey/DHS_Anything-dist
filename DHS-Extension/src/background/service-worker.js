@@ -5,7 +5,7 @@ importScripts('../shared/mk-provider-lookup.js');
 importScripts('../shared/naver-line-map.js');
 importScripts('../shared/building-units-resolver.js');
 
-globalThis.__DHS_SERVICE_WORKER_VERSION__ = '0.1.319';
+globalThis.__DHS_SERVICE_WORKER_VERSION__ = '0.1.320';
 const PROVIDER_SOURCE = 'DHS_ANYTHING_PROVIDER_CAPTURE';
 const BRIDGE_SOURCE = 'DHS_ANYTHING_CHROME_BRIDGE';
 const DEBUGGER_PROTOCOL_VERSION = '1.3';
@@ -1489,7 +1489,7 @@ function regionExportSenderTrusted(sender) {
 
 function sanitizeRegionExportFilename(value) {
   const filename = String(value || '').trim();
-  return /^dhs-region-\d{8}-\d{6}\.csv$/.test(filename) ? filename : '';
+  return /^dhs-region-\d{8}-\d{6}\.(csv|xlsx)$/.test(filename) ? filename : '';
 }
 
 function downloadRegionExportCsv(data, sender, sendResponse) {
@@ -1498,17 +1498,34 @@ function downloadRegionExportCsv(data, sender, sendResponse) {
     return false;
   }
   const filename = sanitizeRegionExportFilename(data && data.filename);
+  // The cleaned workbook is delivered as base64-encoded .xlsx bytes (real spreadsheet columns); legacy
+  // csvText is still accepted for compatibility. Build the right data: URL for whichever is present.
+  const xlsxBase64 = typeof (data && data.xlsxBase64) === 'string' ? data.xlsxBase64 : '';
   const csvText = typeof (data && data.csvText) === 'string' ? data.csvText : '';
-  const byteLength = new TextEncoder().encode(csvText).byteLength;
-  if (!filename || !csvText || byteLength > REGION_EXPORT_MAX_CSV_BYTES) {
-    sendResponse({ ok: false, reason: !filename ? 'invalid-filename' : 'invalid-csv-size' });
+  let url = '';
+  if (xlsxBase64) {
+    const approxBytes = Math.floor(xlsxBase64.length * 3 / 4);
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(xlsxBase64) || approxBytes > REGION_EXPORT_MAX_CSV_BYTES) {
+      sendResponse({ ok: false, reason: 'invalid-xlsx-size' });
+      return false;
+    }
+    url = `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${xlsxBase64}`;
+  } else {
+    const byteLength = new TextEncoder().encode(csvText).byteLength;
+    if (!csvText || byteLength > REGION_EXPORT_MAX_CSV_BYTES) {
+      sendResponse({ ok: false, reason: 'invalid-csv-size' });
+      return false;
+    }
+    url = `data:text/csv;charset=utf-8,${encodeURIComponent(csvText)}`;
+  }
+  if (!filename) {
+    sendResponse({ ok: false, reason: 'invalid-filename' });
     return false;
   }
   if (!chrome.downloads || typeof chrome.downloads.download !== 'function') {
     sendResponse({ ok: false, reason: 'downloads-unavailable' });
     return false;
   }
-  const url = `data:text/csv;charset=utf-8,${encodeURIComponent(csvText)}`;
   try {
     chrome.downloads.download({
       url,

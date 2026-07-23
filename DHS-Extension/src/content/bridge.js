@@ -4268,6 +4268,40 @@
     }]);
   }
 
+  // The user asked for the cleaned output as .xlsx (CSV "정리가 잘 안돼"): a real spreadsheet keeps every
+  // column separated and preserves 동/호 leading zeros as text. Build a 2D grid from the same simple
+  // columns the CSV used, then hand it to the dependency-free xlsx writer.
+  function regionExportRows2D(rows) {
+    const collectedAt = new Date().toISOString();
+    const grid = [REGION_EXPORT_SIMPLE_HEADERS.slice()];
+    (Array.isArray(rows) ? rows : []).forEach((row) => {
+      grid.push(regionExportSimpleRow(stripRegionExportRow(row), collectedAt)
+        .map((value) => String(value == null ? '' : value)));
+    });
+    return grid;
+  }
+
+  function regionExportStatusRows2D(status, message) {
+    return regionExportRows2D([{
+      rowIndex: 0,
+      dongHoStatus: status || 'status',
+      dongHoSource: 'export',
+      text: message || ''
+    }]);
+  }
+
+  function regionExportXlsxWriter() {
+    if (typeof DHS_XLSX_WRITER !== 'undefined' && DHS_XLSX_WRITER) return DHS_XLSX_WRITER;
+    if (typeof globalThis !== 'undefined' && globalThis.DHS_XLSX_WRITER) return globalThis.DHS_XLSX_WRITER;
+    return null;
+  }
+
+  function buildRegionExportXlsxBase64(grid) {
+    const writer = regionExportXlsxWriter();
+    if (!writer || typeof writer.buildXlsx !== 'function') return '';
+    return writer.buildXlsx(grid, { sheetName: '동호수 정리' }).base64;
+  }
+
   function regionExportRowHasDongHoEvidence(row) {
     const safe = row || {};
     if (safe.listingContextContractVersion >= 1 && safe.listingContextMatched !== true) return false;
@@ -4301,7 +4335,7 @@
     };
   }
 
-  async function downloadRegionExportCsv(filename, csvText) {
+  async function downloadRegionExportWorkbook(filename, xlsxBase64) {
     return new Promise((resolve, reject) => {
       let settled = false;
       const finish = (error, value) => {
@@ -4318,7 +4352,7 @@
         source: BRIDGE_SOURCE,
         type: 'DOWNLOAD_REGION_EXPORT',
         filename,
-        csvText
+        xlsxBase64
       }, (response) => {
         if (!response || response.ok !== true) {
           finish(new Error(String(response && response.reason || 'region-export-download-failed')));
@@ -4459,12 +4493,22 @@
         ? state.regionPickerOptions
         : [];
       optionsNode.hidden = !showOptions || (levelOptions.length === 0 && !state.regionPickerLoading);
-      if (state.regionPickerLoading && showOptions) {
-        optionsNode.innerHTML = '<div class="dhs-region-option is-loading" aria-disabled="true">\uBD88\uB7EC\uC624\uB294 \uC911\u2026</div>';
-      } else {
-        optionsNode.innerHTML = levelOptions.map((option) => {
-          return '<button type="button" class="dhs-region-option" role="option" aria-selected="false" data-dhs-action="pick-region-option" data-dhs-region-cortarno="' + escapeHtml(option.cortarNo) + '">' + escapeHtml(option.cortarName) + '</button>';
-        }).join('');
+      // renderOverlay() runs on every scan tick (~1/s). Rebuilding innerHTML each time replaces the
+      // option <button> nodes mid-interaction, so a click landing between mousedown and mouseup gets
+      // cancelled (user has to click twice). Only rewrite when the rendered set actually changed.
+      const loadingCell = state.regionPickerLoading && showOptions;
+      const optionSig = loadingCell
+        ? 'loading'
+        : levelOptions.map((option) => `${option.cortarNo}:${option.cortarName}`).join('|');
+      if (optionsNode.getAttribute('data-dhs-options-sig') !== optionSig) {
+        optionsNode.setAttribute('data-dhs-options-sig', optionSig);
+        if (loadingCell) {
+          optionsNode.innerHTML = '<div class="dhs-region-option is-loading" aria-disabled="true">\uBD88\uB7EC\uC624\uB294 \uC911\u2026</div>';
+        } else {
+          optionsNode.innerHTML = levelOptions.map((option) => {
+            return '<button type="button" class="dhs-region-option" role="option" aria-selected="false" data-dhs-action="pick-region-option" data-dhs-region-cortarno="' + escapeHtml(option.cortarNo) + '">' + escapeHtml(option.cortarName) + '</button>';
+          }).join('');
+        }
       }
     }
     if (choose) {
@@ -6428,7 +6472,7 @@
       : '';
     const runId = regionExportRunId + 1;
     regionExportRunId = runId;
-    const filename = `dhs-region-${currentTimestampForFilename()}.csv`;
+    const filename = `dhs-region-${currentTimestampForFilename()}.xlsx`;
     state.lastEvent = 'region-export';
     state.regionExportStatus = 'preparing';
     state.regionExportRowCount = 0;
@@ -6532,7 +6576,7 @@
       state.regionExportLastError = errorMessage;
       if (!beginRegionExportFileWrite(runId)) return;
       try {
-        await downloadRegionExportCsv(filename, buildRegionExportStatusCsv('error', errorMessage));
+        await downloadRegionExportWorkbook(filename, buildRegionExportXlsxBase64(regionExportStatusRows2D('error', errorMessage)));
       } catch (writeError) {
         state.regionExportLastError = String(writeError && writeError.message || writeError || errorMessage || '').slice(0, 120);
       }
@@ -6550,7 +6594,7 @@
       if (!beginRegionExportFileWrite(runId)) return;
       let finalStatus = 'no-rows';
       try {
-        await downloadRegionExportCsv(filename, buildRegionExportStatusCsv('no-rows', 'no listing rows collected'));
+        await downloadRegionExportWorkbook(filename, buildRegionExportXlsxBase64(regionExportStatusRows2D('no-rows', 'no listing rows collected')));
       } catch (error) {
         finalStatus = 'error';
         state.regionExportLastError = String(error && error.message || error || '').slice(0, 120);
@@ -6569,9 +6613,9 @@
       if (!beginRegionExportFileWrite(runId)) return;
       let finalStatus = 'quality-blocked';
       try {
-        await downloadRegionExportCsv(
+        await downloadRegionExportWorkbook(
           filename,
-          buildRegionExportStatusCsv('grouped-retry-pending', message)
+          buildRegionExportXlsxBase64(regionExportStatusRows2D('grouped-retry-pending', message))
         );
       } catch (error) {
         finalStatus = 'error';
@@ -6590,7 +6634,7 @@
       if (!beginRegionExportFileWrite(runId)) return;
       let finalStatus = 'quality-blocked';
       try {
-        await downloadRegionExportCsv(filename, buildRegionExportStatusCsv('quality-blocked', quality.message));
+        await downloadRegionExportWorkbook(filename, buildRegionExportXlsxBase64(regionExportStatusRows2D('quality-blocked', quality.message)));
       } catch (error) {
         finalStatus = 'error';
         state.regionExportLastError = String(error && error.message || error || '').slice(0, 120);
@@ -6603,7 +6647,7 @@
     }
     if (!beginRegionExportFileWrite(runId)) return;
     try {
-      const download = await downloadRegionExportCsv(filename, buildCurrentRegionCsv(rows));
+      const download = await downloadRegionExportWorkbook(filename, buildRegionExportXlsxBase64(regionExportRows2D(rows)));
       if (runId !== regionExportRunId) return;
       const checkpointCleared = await clearRegionExportCheckpoint(regionKey);
       if (runId !== regionExportRunId) return;

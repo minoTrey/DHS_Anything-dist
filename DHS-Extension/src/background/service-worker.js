@@ -5,7 +5,7 @@ importScripts('../shared/mk-provider-lookup.js');
 importScripts('../shared/naver-line-map.js');
 importScripts('../shared/building-units-resolver.js');
 
-globalThis.__DHS_SERVICE_WORKER_VERSION__ = '0.1.322';
+globalThis.__DHS_SERVICE_WORKER_VERSION__ = '0.1.323';
 const PROVIDER_SOURCE = 'DHS_ANYTHING_PROVIDER_CAPTURE';
 const BRIDGE_SOURCE = 'DHS_ANYTHING_CHROME_BRIDGE';
 const DEBUGGER_PROTOCOL_VERSION = '1.3';
@@ -1747,6 +1747,28 @@ async function dhsNotifyUpdateOnce(latestVersion) {
   } catch (_) { /* ignore notify errors */ }
 }
 
+// Apply a downloaded update WITHOUT the user having to hit chrome://extensions → reload. For an unpacked
+// extension chrome.runtime.reload() re-reads the on-disk folder (which the autoupdate keeps current), so
+// this is what actually makes a shipped fix reach the running extension. Guard: reload at most ONCE per
+// target version so a still-catching-up on-disk folder can never cause a reload loop.
+async function dhsMaybeAutoReloadToLatest(latestVersion) {
+  try {
+    if (!chrome.runtime || typeof chrome.runtime.reload !== 'function') return;
+    const stored = await chrome.storage.local.get('dhsAutoReload');
+    const prev = stored && stored.dhsAutoReload;
+    if (prev && prev.version === latestVersion) return; // already tried reloading for this version
+    // Don't yank the extension out from under active work (a live provider lookup / region export row).
+    try {
+      const activeContext = providerStore && typeof providerStore.currentRequestContext === 'function'
+        ? providerStore.currentRequestContext()
+        : null;
+      if (activeContext) return;
+    } catch (_) {}
+    await chrome.storage.local.set({ dhsAutoReload: { version: latestVersion, at: Date.now() } });
+    chrome.runtime.reload();
+  } catch (_) { /* reload unavailable — the badge/notification still prompts a manual reload */ }
+}
+
 async function dhsCheckForUpdate() {
   try {
     if (!DHS_UPDATE_VERSION_URL) return; // version feed not configured yet
@@ -1768,7 +1790,13 @@ async function dhsCheckForUpdate() {
       }
     });
     await dhsApplyUpdateIndicator(available, latestVersion);
-    if (available) await dhsNotifyUpdateOnce(latestVersion);
+    if (available) {
+      await dhsNotifyUpdateOnce(latestVersion);
+      await dhsMaybeAutoReloadToLatest(latestVersion);
+    } else {
+      // Running version has caught up to (or passed) the feed — clear the reload guard for next time.
+      try { await chrome.storage.local.remove('dhsAutoReload'); } catch (_) {}
+    }
   } catch (_) { /* offline / transient — retry on next alarm */ }
 }
 

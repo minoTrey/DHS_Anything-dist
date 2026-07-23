@@ -653,6 +653,7 @@
   // While >0, the region-export shield is click-through (pointer-events:none) so the extraction's own
   // coordinate-based trusted clicks can land on the page; otherwise the shield blocks user clicks.
   let regionExportShieldClickThroughDepth = 0;
+  let lastRegionExportHeartbeatAt = 0;
   let regionExportRunId = 0;
   let regionExportMarkerNoncePromise = null;
   let regionExportResumeRegionKey = '';
@@ -6886,8 +6887,22 @@
     return shield;
   }
 
+  // Heartbeat so the SW's auto-update never reloads the extension out from under a running region export
+  // (that reload silently kills the run — "처리 중" vanishes, no file saved). Throttled; expires on its own.
+  function markRegionExportHeartbeat() {
+    const now = Date.now();
+    if (now - lastRegionExportHeartbeatAt < 4000) return;
+    lastRegionExportHeartbeatAt = now;
+    try {
+      if (chrome && chrome.storage && chrome.storage.local) {
+        chrome.storage.local.set({ dhsRegionExportActiveAt: now });
+      }
+    } catch (_) {}
+  }
+
   function updateRegionExportShield() {
     const active = regionExportShieldActive();
+    if (active) markRegionExportHeartbeat();
     const shield = active ? ensureRegionExportShield() : document.getElementById(REGION_EXPORT_SHIELD_ID);
     if (!shield) return;
     if (!active) {

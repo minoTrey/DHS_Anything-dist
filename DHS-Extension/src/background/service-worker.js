@@ -5,7 +5,7 @@ importScripts('../shared/mk-provider-lookup.js');
 importScripts('../shared/naver-line-map.js');
 importScripts('../shared/building-units-resolver.js');
 
-globalThis.__DHS_SERVICE_WORKER_VERSION__ = '0.1.324';
+globalThis.__DHS_SERVICE_WORKER_VERSION__ = '0.1.325';
 const PROVIDER_SOURCE = 'DHS_ANYTHING_PROVIDER_CAPTURE';
 const BRIDGE_SOURCE = 'DHS_ANYTHING_CHROME_BRIDGE';
 const DEBUGGER_PROTOCOL_VERSION = '1.3';
@@ -1757,12 +1757,17 @@ async function dhsMaybeAutoReloadToLatest(latestVersion) {
     const stored = await chrome.storage.local.get('dhsAutoReload');
     const prev = stored && stored.dhsAutoReload;
     if (prev && prev.version === latestVersion) return; // already tried reloading for this version
-    // Don't yank the extension out from under active work (a live provider lookup / region export row).
+    // Don't yank the extension out from under active work — a live provider lookup OR a running region
+    // export (its content-script heartbeat, refreshed while preparing/running/saving). Reloading mid-run
+    // silently kills the export ("처리 중" vanishes, no file). Defer to a later check when it's idle.
     try {
       const activeContext = providerStore && typeof providerStore.currentRequestContext === 'function'
         ? providerStore.currentRequestContext()
         : null;
       if (activeContext) return;
+      const stored = await chrome.storage.local.get('dhsRegionExportActiveAt');
+      const beatAt = stored && Number(stored.dhsRegionExportActiveAt || 0);
+      if (beatAt && (Date.now() - beatAt) < 90000) return; // export active within the last 90s
     } catch (_) {}
     await chrome.storage.local.set({ dhsAutoReload: { version: latestVersion, at: Date.now() } });
     chrome.runtime.reload();

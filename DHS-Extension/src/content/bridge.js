@@ -4282,12 +4282,33 @@
   }
 
   function regionExportStatusRows2D(status, message) {
-    return regionExportRows2D([{
+    const grid = regionExportRows2D([{
       rowIndex: 0,
       dongHoStatus: status || 'status',
       dongHoSource: 'export',
       text: message || ''
     }]);
+    // Append self-diagnosing breadcrumbs (why the run produced no usable rows). Padded to the column
+    // count so the spreadsheet stays rectangular.
+    const width = REGION_EXPORT_SIMPLE_HEADERS.length;
+    const pad = (label, value) => {
+      const row = new Array(width).fill('');
+      row[0] = label;
+      row[1] = String(value == null ? '' : value);
+      return row;
+    };
+    const diag = state.regionExportRunDiagnostic && typeof state.regionExportRunDiagnostic === 'object'
+      ? state.regionExportRunDiagnostic
+      : {};
+    grid.push(pad('[진단] 상태', status || ''));
+    grid.push(pad('[진단] 메시지', message || ''));
+    grid.push(pad('[진단] 선택지역', diag.picked || ''));
+    grid.push(pad('[진단] 네이버(추출전)', diag.naverBefore || ''));
+    grid.push(pad('[진단] 지역적용', diag.restore || ''));
+    if (diag.naverAfter != null) grid.push(pad('[진단] 네이버(적용후)', diag.naverAfter || ''));
+    grid.push(pad('[진단] 단지수', String(Math.max(0, Number(state.regionExportComplexTargetCount || 0) || 0))));
+    grid.push(pad('[진단] 마지막사유', String(state.regionExportComplexLastReason || state.regionExportLastError || '')));
+    return grid;
   }
 
   function regionExportXlsxWriter() {
@@ -6519,9 +6540,18 @@
     // 'selector-complete'); the DHS-native picker sets proof 'dhs-picker', so gating on it skipped the
     // restore entirely → Naver stayed on the wrong region → checkpoint marker failed → "저장 실패".
     // The pick came from Naver's own regions API, so the key always maps to a real region to restore.
+    // Self-diagnosing breadcrumbs written into any diagnostic/no-rows workbook so a failed run explains
+    // itself (was the region applied? how many complexes did Naver show?) without needing a live session.
+    state.regionExportRunDiagnostic = {
+      picked: String(confirmedSelection.label || confirmedSelection.key || ''),
+      naverBefore: String((currentRegionSelection() || {}).label || ''),
+      restore: 'skipped-already-current'
+    };
     if (!currentRegionComplexContextMatchesKey(confirmedSelection.key)) {
       const restoredSelection = await restoreCurrentRegionExportSelection(confirmedSelection.key, runId);
       if (runId !== regionExportRunId) return;
+      state.regionExportRunDiagnostic.restore = String(restoredSelection.reason || (restoredSelection.ok ? 'ok' : 'failed'));
+      state.regionExportRunDiagnostic.naverAfter = String((currentRegionSelection() || {}).label || '');
       if (!restoredSelection.ok) {
         state.regionExportSelectionProof = '';
         state.regionExportStatus = 'error';

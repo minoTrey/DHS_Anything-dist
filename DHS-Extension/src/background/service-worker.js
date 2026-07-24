@@ -5,7 +5,7 @@ importScripts('../shared/mk-provider-lookup.js');
 importScripts('../shared/naver-line-map.js');
 importScripts('../shared/building-units-resolver.js');
 
-globalThis.__DHS_SERVICE_WORKER_VERSION__ = '0.1.327';
+globalThis.__DHS_SERVICE_WORKER_VERSION__ = '0.1.328';
 const PROVIDER_SOURCE = 'DHS_ANYTHING_PROVIDER_CAPTURE';
 const BRIDGE_SOURCE = 'DHS_ANYTHING_CHROME_BRIDGE';
 const DEBUGGER_PROTOCOL_VERSION = '1.3';
@@ -1765,9 +1765,27 @@ async function dhsMaybeAutoReloadToLatest(latestVersion) {
         ? providerStore.currentRequestContext()
         : null;
       if (activeContext) return;
-      const stored = await chrome.storage.local.get('dhsRegionExportActiveAt');
-      const beatAt = stored && Number(stored.dhsRegionExportActiveAt || 0);
-      if (beatAt && (Date.now() - beatAt) < 90000) return; // export active within the last 90s
+      const beat = await chrome.storage.local.get('dhsRegionExportActiveAt');
+      const beatAt = beat && Number(beat.dhsRegionExportActiveAt || 0);
+      // 10-minute idle window: NEVER reload while a region export is running or was recently active. A
+      // single provider lookup / listings-wait can legitimately exceed a minute, so a tight window risked
+      // a reload slipping into a heartbeat gap and killing the run. Only auto-apply once truly idle.
+      if (beatAt && (Date.now() - beatAt) < 600000) return;
+      // Critically: only reload when NO Naver tab is open. Reloading while a tab is live re-injects the
+      // content scripts on top of the existing ones (version-mismatched double injection → duplicate
+      // overlays, lock contention, stalled exports). Defer until every Naver tab is closed; then the next
+      // page load gets a clean matching content script. (This — not a code bug — is what stalled exports.)
+      if (typeof chrome.tabs !== 'undefined' && typeof chrome.tabs.query === 'function') {
+        const naverTabs = await new Promise((resolve) => {
+          try {
+            chrome.tabs.query(
+              { url: ['*://new.land.naver.com/*', '*://fin.land.naver.com/*'] },
+              (tabs) => { void chrome.runtime.lastError; resolve(Array.isArray(tabs) ? tabs : []); }
+            );
+          } catch (_) { resolve([]); }
+        });
+        if (naverTabs.length > 0) return;
+      }
     } catch (_) {}
     await chrome.storage.local.set({ dhsAutoReload: { version: latestVersion, at: Date.now() } });
     chrome.runtime.reload();

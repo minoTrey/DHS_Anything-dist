@@ -254,9 +254,11 @@
     if (!excelRows.length) return summaryRows;
     const suppressDongHo = Boolean(options.suppressDongHo);
     const pushRow = (label, value) => {
+      if (!label) return;
       if (suppressDongHo && isHoSummaryLabel(label)) return;
-      const text = compactText(value);
-      if (label && text) summaryRows.push({ label, value: text });
+      // Fixed table: keep the row even when the value is empty (render a blank cell) so the 물건 조사 결과
+      // panel keeps a constant set of rows and never grows/shrinks between renders.
+      summaryRows.push({ label, value: compactText(value) });
     };
     excelRows.forEach((item) => {
       if (Array.isArray(item)) {
@@ -347,9 +349,10 @@
     return '\uCC98\uB9AC\uC911';
   }
 
+  // Set (never drop) a row. Empty values are kept as blank cells so the fixed table never changes shape.
+  // \uCC98\uB9AC\uC0C1\uD0DC/\uAC78\uB9B0\uC2DC\uAC04 are placed just before \uC218\uC9D1\uC2DC\uAC04 for a stable order.
   function upsertSummaryRow(rows, label, value) {
     const text = compactText(value);
-    if (!text) return rows;
     const index = rows.findIndex((row) => row && row.label === label);
     if (index >= 0) {
       rows[index] = { label, value: text };
@@ -363,30 +366,20 @@
     return rows;
   }
 
+  // \uCC98\uB9AC\uC0C1\uD0DC and \uAC78\uB9B0\uC2DC\uAC04 are ALWAYS present (fixed rows) so the \uBB3C\uAC74 \uC870\uC0AC \uACB0\uACFC panel keeps a constant
+  // height. \uAC78\uB9B0\uC2DC\uAC04 holds a frozen value only once a confirmed exact is latched (no ticking / no
+  // per-second DOM churn); it stays blank until then. This replaces the old presence-gated logic that
+  // made rows pop in and out (panel grew/shrank, extra render churn, more complexity).
   function appendCurrentListingProcessingRows(rows, input, row) {
     const output = Array.isArray(rows) ? rows.slice() : [];
     const sourceRow = row || {};
-    const terminal = ['exact', 'multiple-candidates', 'unresolved', 'context-mismatch']
-      .includes(compactText(sourceRow.dongHoStatus));
-    const hasRowElapsed = Object.prototype.hasOwnProperty.call(sourceRow, 'routeSearchElapsedSec')
-      && Number.isFinite(Number(sourceRow.routeSearchElapsedSec));
-    const hasRouteStatus = Boolean(compactText(input && input.routeSearchStatus));
-    const hasElapsed = input
-      && Object.prototype.hasOwnProperty.call(input, 'routeSearchElapsedSec')
-      && Number.isFinite(Number(input.routeSearchElapsedSec));
-    if (!hasRouteStatus && !hasElapsed) return output;
     upsertSummaryRow(output, '\uCC98\uB9AC\uC0C1\uD0DC', currentListingProcessingValue(input, row));
-    // Render \uAC78\uB9B0\uC2DC\uAC04 ONLY once a confirmed exact is latched for this listing \u2014 the single stable,
-    // frozen "done" signal. Every row/displaySettled-based gate was defeated because those states
-    // oscillate (waiting\u2194multiple-candidates) while the loop retries, so elapsed flickered on and
-    // ticked via the live value. The confirmed-exact latch is set once and held, so gating on it (and
-    // using the frozen per-row elapsed) means \uAC78\uB9B0\uC2DC\uAC04 appears exactly at \uB3D9\uD638\uC218 \uD655\uC815 and never ticks \u2014
-    // the processing overlay stays static, no per-second DOM/probe churn.
     const confirmedSettled = Boolean(input && input.confirmedExactMarker
       && input.confirmedExactMarker === input.articleMarker);
-    if (confirmedSettled && hasRowElapsed) {
-      upsertSummaryRow(output, '\uAC78\uB9B0\uC2DC\uAC04', formatDuration(sourceRow.routeSearchElapsedSec));
-    }
+    const hasRowElapsed = Object.prototype.hasOwnProperty.call(sourceRow, 'routeSearchElapsedSec')
+      && Number.isFinite(Number(sourceRow.routeSearchElapsedSec));
+    upsertSummaryRow(output, '\uAC78\uB9B0\uC2DC\uAC04',
+      (confirmedSettled && hasRowElapsed) ? formatDuration(sourceRow.routeSearchElapsedSec) : '');
     return output;
   }
 

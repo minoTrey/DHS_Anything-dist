@@ -654,6 +654,7 @@
   // coordinate-based trusted clicks can land on the page; otherwise the shield blocks user clicks.
   let regionExportShieldClickThroughDepth = 0;
   let lastRegionExportHeartbeatAt = 0;
+  let regionExportInProgressRows = [];
   let regionExportRunId = 0;
   let regionExportMarkerNoncePromise = null;
   let regionExportResumeRegionKey = '';
@@ -4222,9 +4223,13 @@
 
   function regionExportSimpleRowsForOverlay(row, options) {
     const simpleRow = regionExportSimpleRow(row, row && row.collectedAt || '');
+    // keepEmpty: the current-listing 물건 조사 결과 table must show a FIXED column set every render —
+    // empty fields stay as blank rows instead of vanishing, so the panel never grows/shrinks (the churn
+    // the user saw). Batch/region rows still drop empties (keepEmpty falsy).
+    const keepEmpty = Boolean(options && options.keepEmpty);
     const displayRows = REGION_EXPORT_SIMPLE_HEADERS
       .map((label, index) => ({ label, value: simpleRow[index] || '' }))
-      .filter((item) => normalizeText(item.value));
+      .filter((item) => keepEmpty || normalizeText(item.value));
     const processingRows = regionExportProcessingRowsForOverlay(row, options);
     if (!processingRows.length) return displayRows;
     const collectedIndex = displayRows.findIndex((item) => item.label === '\uC218\uC9D1\uC2DC\uAC04');
@@ -4463,6 +4468,16 @@
     regionExportRunId += 1;
     providerRequestGeneration += 1;
     finishRegionExportTiming();
+    // Save whatever was collected up to the cancel point (the checkpoint is ALSO kept, so "다시 이어서"
+    // can still resume from here). This gives the user the "중단 지점까지 저장" they asked for.
+    const partialRows = Array.isArray(regionExportInProgressRows) ? regionExportInProgressRows.slice() : [];
+    const dataRows = partialRows.filter((row) => row && row.dongHoSource !== 'export');
+    if (dataRows.length) {
+      const partialBase = `dhs-region-${currentTimestampForFilename()}-partial`;
+      saveRegionExportWorkbook(partialBase, regionExportRows2D(dataRows), buildCurrentRegionCsv(dataRows))
+        .then((saved) => { state.regionExportSavedPath = (saved && saved.path) || `Downloads/DHS/${partialBase}.xlsx`; renderOverlay(); })
+        .catch(() => {});
+    }
     state.regionExportStatus = 'cancelled';
     state.regionExportLastError = 'user-cancelled';
     state.providerOpenStatus = 'cancelled';
@@ -5226,7 +5241,8 @@
     return Object.assign({}, cleaned, {
       // Suppress the baked live-ticking 걸린시간 for the current-listing overlay; overlay-view adds it
       // (frozen) only once a confirmed exact is latched, so the processing overlay stays static.
-      excelRows: regionExportSimpleRowsForOverlay(cleaned, { suppressElapsed: true })
+      // keepEmpty: fixed column set — blank rows instead of vanishing ones (stable panel size).
+      excelRows: regionExportSimpleRowsForOverlay(cleaned, { suppressElapsed: true, keepEmpty: true })
     });
   }
 
@@ -6367,6 +6383,8 @@
     const resume = resumeInput && typeof resumeInput === 'object' ? resumeInput : {};
     const expectedSelectionKey = state.regionExportSelectionKey;
     const rows = [];
+    // Expose the live accumulating rows so a mid-run cancel can save the partial results collected so far.
+    regionExportInProgressRows = rows;
     const seen = new Set();
     const checkpointContext = {
       regionKey: resume.regionKey || '',

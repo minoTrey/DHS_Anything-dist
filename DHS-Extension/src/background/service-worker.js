@@ -5,7 +5,7 @@ importScripts('../shared/mk-provider-lookup.js');
 importScripts('../shared/naver-line-map.js');
 importScripts('../shared/building-units-resolver.js');
 
-globalThis.__DHS_SERVICE_WORKER_VERSION__ = '0.1.329';
+globalThis.__DHS_SERVICE_WORKER_VERSION__ = '0.1.330';
 const PROVIDER_SOURCE = 'DHS_ANYTHING_PROVIDER_CAPTURE';
 const BRIDGE_SOURCE = 'DHS_ANYTHING_CHROME_BRIDGE';
 const DEBUGGER_PROTOCOL_VERSION = '1.3';
@@ -362,6 +362,36 @@ function detachDebugger(target, callback) {
   }
 }
 
+// During a region export we keep the debugger attached ACROSS clicks instead of attach→click→detach each
+// time. The per-click attach/detach makes Chrome's "started debugging" infobar flash and repeatedly raises
+// the window to the front — the opposite of the requested unattended/background behavior. We hold the
+// attachment on the export tab and release it only after a short idle (no clicks) or when it ends.
+let heldDebuggerTabId = null;
+let heldDebuggerReleaseTimer = null;
+
+function releaseHeldDebugger() {
+  if (heldDebuggerReleaseTimer) { clearTimeout(heldDebuggerReleaseTimer); heldDebuggerReleaseTimer = null; }
+  const tabId = heldDebuggerTabId;
+  heldDebuggerTabId = null;
+  if (tabId) detachDebugger({ tabId });
+}
+
+function scheduleHeldDebuggerRelease() {
+  if (heldDebuggerReleaseTimer) clearTimeout(heldDebuggerReleaseTimer);
+  heldDebuggerReleaseTimer = setTimeout(releaseHeldDebugger, 20000);
+}
+
+// If Chrome tears down our attachment on its own (tab closed, DevTools opened, target crashed), forget
+// the held tab so we don't try to reuse a dead session.
+if (chrome.debugger && chrome.debugger.onDetach && typeof chrome.debugger.onDetach.addListener === 'function') {
+  chrome.debugger.onDetach.addListener((source) => {
+    if (source && source.tabId === heldDebuggerTabId) {
+      if (heldDebuggerReleaseTimer) { clearTimeout(heldDebuggerReleaseTimer); heldDebuggerReleaseTimer = null; }
+      heldDebuggerTabId = null;
+    }
+  });
+}
+
 function focusTabAfterDelay(tabId, delayMs) {
   if (!tabId || !delayMs || !chrome.tabs || typeof chrome.tabs.update !== 'function') return;
   setTimeout(() => {
@@ -486,19 +516,33 @@ function providerCaptureSenderTrusted(sender) {
   return Boolean(tabId && pendingProviderOpenerTabId && tabId !== pendingProviderOpenerTabId && openerTabId === pendingProviderOpenerTabId);
 }
 
-function dispatchMouseSequence(target, x, y, returnFocusDelayMs, sendResponse) {
+function dispatchMouseSequence(target, x, y, returnFocusDelayMs, sendResponse, keepAttached) {
+  // Fail path: fully release the held attachment so a broken session can't get stuck.
+  const fail = (reason) => {
+    if (keepAttached) { releaseHeldDebugger(); sendResponse({ ok: false, reason }); }
+    else { detachDebugger(target, () => sendResponse({ ok: false, reason })); }
+  };
+  // Success path: when keeping attached, DON'T detach (that flash/raise is what we're avoiding) — just
+  // schedule an idle release. Otherwise detach as before.
+  const done = () => {
+    if (keepAttached) {
+      scheduleHeldDebuggerRelease();
+      focusTabAfterDelay(target.tabId, returnFocusDelayMs);
+      sendResponse({ ok: true });
+    } else {
+      detachDebugger(target, () => {
+        focusTabAfterDelay(target.tabId, returnFocusDelayMs);
+        sendResponse({ ok: true });
+      });
+    }
+  };
   chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
     type: 'mouseMoved',
     x,
     y,
     button: 'none'
   }, () => {
-    const moveError = chrome.runtime.lastError;
-    if (moveError) {
-      detachDebugger(target, () => sendResponse({ ok: false, reason: 'debugger-move-failed' }));
-      return;
-    }
-
+    if (chrome.runtime.lastError) { fail('debugger-move-failed'); return; }
     chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
       type: 'mousePressed',
       x,
@@ -506,12 +550,7 @@ function dispatchMouseSequence(target, x, y, returnFocusDelayMs, sendResponse) {
       button: 'left',
       clickCount: 1
     }, () => {
-      const pressError = chrome.runtime.lastError;
-      if (pressError) {
-        detachDebugger(target, () => sendResponse({ ok: false, reason: 'debugger-press-failed' }));
-        return;
-      }
-
+      if (chrome.runtime.lastError) { fail('debugger-press-failed'); return; }
       chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
         type: 'mouseReleased',
         x,
@@ -519,15 +558,8 @@ function dispatchMouseSequence(target, x, y, returnFocusDelayMs, sendResponse) {
         button: 'left',
         clickCount: 1
       }, () => {
-        const releaseFailed = Boolean(chrome.runtime.lastError);
-        detachDebugger(target, () => {
-          if (releaseFailed) {
-            sendResponse({ ok: false, reason: 'debugger-release-failed' });
-            return;
-          }
-          focusTabAfterDelay(target.tabId, returnFocusDelayMs);
-          sendResponse({ ok: true });
-        });
+        if (chrome.runtime.lastError) { fail('debugger-release-failed'); return; }
+        done();
       });
     });
   });
@@ -598,6 +630,7 @@ function dispatchProviderClick(data, sender, sendResponse) {
   const x = coordinate(data && data.x);
   const y = coordinate(data && data.y);
   const returnFocusDelayMs = boundedDelay(data && data.returnFocusDelayMs);
+  const keepAttached = Boolean(data && data.keepAttached);
   if (!tabId || x === null || y === null) {
     sendResponse({ ok: false, reason: 'invalid-click-target' });
     return false;
@@ -608,13 +641,33 @@ function dispatchProviderClick(data, sender, sendResponse) {
   }
 
   const target = { tabId };
+  // Reuse an already-held attachment (no re-attach → no infobar flash / window raise).
+  if (keepAttached && heldDebuggerTabId === tabId) {
+    dispatchMouseSequence(target, x, y, returnFocusDelayMs, sendResponse, keepAttached);
+    return true;
+  }
   chrome.debugger.attach(target, DEBUGGER_PROTOCOL_VERSION, () => {
     const attachError = chrome.runtime.lastError;
     if (attachError) {
+      // "Already attached" means we (or a prior held session) still hold it — proceed if keeping.
+      if (keepAttached && /already attached/i.test(String(attachError.message || ''))) {
+        heldDebuggerTabId = tabId;
+        dispatchMouseSequence(target, x, y, returnFocusDelayMs, sendResponse, keepAttached);
+        return;
+      }
       sendResponse({ ok: false, reason: 'debugger-attach-failed' });
       return;
     }
-    dispatchMouseSequence(target, x, y, returnFocusDelayMs, sendResponse);
+    if (keepAttached) {
+      // If we were holding a different tab, release it first.
+      if (heldDebuggerTabId && heldDebuggerTabId !== tabId) {
+        const stale = heldDebuggerTabId;
+        heldDebuggerTabId = null;
+        detachDebugger({ tabId: stale });
+      }
+      heldDebuggerTabId = tabId;
+    }
+    dispatchMouseSequence(target, x, y, returnFocusDelayMs, sendResponse, keepAttached);
   });
   return true;
 }

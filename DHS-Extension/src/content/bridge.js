@@ -5279,7 +5279,10 @@
         // Region export runs unattended in the background — the CDP click lands on the tab whether or not
         // it's active, so DON'T re-activate (focus) the Naver tab after each click. returnFocusDelayMs:0
         // makes the SW skip the tab activation that was yanking focus back to 부동산 mid-extraction.
-        returnFocusDelayMs: 0
+        returnFocusDelayMs: 0,
+        // Hold the debugger attached across the whole export instead of attach/detach per click — the
+        // per-click re-attach flashes Chrome's debug infobar and repeatedly raises the window to the front.
+        keepAttached: true
       }, (response) => {
         restoreShield();
         if (expectedRunId && expectedRunId !== regionExportRunId) {
@@ -7028,6 +7031,16 @@
       if (target.getAttribute('data-dhs-action') === 'export-region') {
         if (state.regionExportStatus === 'running') {
           cancelCurrentRegionExport();
+          return;
+        }
+        // "다시 이어서": the user cancelled mid-run. Re-run the SAME confirmed region so
+        // exportCurrentRegionFromOverlay picks up the saved checkpoint (resumeRegionKey) and continues
+        // from where it stopped — instead of beginRegionExportSelectionFromOverlay() which wiped it and
+        // sent the user back to a fresh region pick ("그냥 초기화됨").
+        if (state.regionExportStatus === 'cancelled'
+          && state.regionExportLastError === 'user-cancelled'
+          && state.regionExportSelectionKey) {
+          requestConfirmedCurrentRegionExport(state.regionExportSelectionKey);
           return;
         }
         beginRegionExportSelectionFromOverlay();
@@ -10243,7 +10256,9 @@
       // While a region export runs unattended, don't re-activate (focus) the Naver tab after provider
       // clicks — that was stealing focus back to 부동산 while the user worked elsewhere. Interactive
       // single-listing investigation keeps the focus-return so provider popups don't leave the user adrift.
-      returnFocusDelayMs: regionExportShieldActive() ? 0 : 2500
+      returnFocusDelayMs: regionExportShieldActive() ? 0 : 2500,
+      // During region export, hold the debugger attached (no per-click re-attach → no infobar flash / window raise).
+      keepAttached: regionExportShieldActive()
     }, (response) => {
       if (response && response.ok) {
         markProviderClickStarted('trusted-clicked', phase, result);

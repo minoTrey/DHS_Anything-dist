@@ -6937,6 +6937,19 @@
     if (shield.style.display !== 'flex') shield.style.display = 'flex';
     const clickThrough = regionExportShieldClickThroughDepth > 0 ? 'none' : 'auto';
     if (shield.style.pointerEvents !== clickThrough) shield.style.pointerEvents = clickThrough;
+    // The shield's own pointer-events:none does NOT propagate to its children (their inline
+    // pointer-events:auto wins). During a trusted extraction click that must reach a Naver popup option
+    // BEHIND the centered box, the box/cancel button would otherwise intercept the click → the click lands
+    // outside the option → Naver closes the popup → region navigation (restore) fails at the next step.
+    // So the box and cancel must go click-through too while we drive a trusted click.
+    Array.from(shield.children).forEach((child) => {
+      if (child.style && child.style.pointerEvents !== clickThrough) child.style.pointerEvents = clickThrough;
+      if (child.querySelectorAll) {
+        Array.from(child.querySelectorAll('*')).forEach((node) => {
+          if (node.style && node.style.pointerEvents !== clickThrough) node.style.pointerEvents = clickThrough;
+        });
+      }
+    });
     const sub = shield.querySelector('.dhs-region-shield-sub');
     if (sub) {
       const label = state.regionExportStatus === 'saving'

@@ -35,6 +35,7 @@
   ]);
 
   const DIRECT_CPID_FAMILY_MAP = Object.freeze({
+    sunbang: 'homesdid',
     fine: 'rfine',
     rter: 'rter',
     serve: 'serve',

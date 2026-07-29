@@ -197,21 +197,18 @@
     const statusMessage = compactText(input.regionExportLastError);
     const dongHo = regionExportDongHoValue(input, currentRow);
     const hoValue = regionExportHoSummaryValue(input, currentRow, dongHo);
-    const summaryRows = [];
-    const pushRow = (label, value) => {
-      const text = compactText(value);
-      if (text) summaryRows.push({ label, value: text });
-    };
-    const excelRows = Array.isArray(currentRow.excelRows) ? currentRow.excelRows : [];
-    if (excelRows.length) {
-      excelRows.forEach((row) => {
-        if (Array.isArray(row)) {
-          pushRow(row[0], row[1]);
-          return;
-        }
-        if (row && typeof row === 'object') pushRow(row.label, row.value);
-      });
-    } else {
+    // Render the current listing under investigation with the SAME builder the single-listing view uses,
+    // so the region-export \uBB3C\uAC74 \uC870\uC0AC \uACB0\uACFC table is identical (fixed columns, blank cells, \uD638\uC218/\uBE44\uACE0 transforms,
+    // \uCC98\uB9AC\uC0C1\uD0DC/\uAC78\uB9B0\uC2DC\uAC04/\uC218\uC9D1\uC2DC\uAC04). Feed the export's current row in as the current-listing row.
+    const listingInput = Object.assign({}, input, { currentListingOverlayRow: currentRow });
+    let summaryRows = currentListingRows(listingInput);
+    if (!summaryRows.length) {
+      // Placeholder rows (status markers with no excelRows) keep the old minimal fallback.
+      summaryRows = [];
+      const pushRow = (label, value) => {
+        const text = compactText(value);
+        if (text) summaryRows.push({ label, value: text });
+      };
       pushRow('\uB2E8\uC9C0', currentRow.complexName);
       pushRow('\uB3D9', currentRow.dong);
       pushRow('\uD638\uC218', hoValue);

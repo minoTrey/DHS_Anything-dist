@@ -243,7 +243,13 @@
 
   function rememberNaverAuthorizationHeader(value) {
     const text = String(value || '').trim();
-    if (/^Bearer\s+/i.test(text)) naverAuthorizationHeader = text;
+    if (/^Bearer\s+/i.test(text) && text !== naverAuthorizationHeader) {
+      naverAuthorizationHeader = text;
+      // Push the captured Naver Bearer token to the isolated-world bridge so the API-driven region export
+      // can call /api/regions/complexes + /api/articles/complex directly (the isolated world's own fetch
+      // does not go through this MAIN-world wrapper, so it can't auto-inject the header itself).
+      try { post({ eventName: 'naver-auth-header', authHeader: text }); } catch (_) {}
+    }
   }
 
   function captureNaverAuthorizationHeader(input, init) {
@@ -2349,5 +2355,66 @@
   };
 
   window.addEventListener('popstate', () => emitUrlContext('popstate'));
+
+  // While an unattended 지역추출 runs, page-initiated popups (window.open / <a target="_blank">) open a NEW
+  // ACTIVE tab, which raises + focuses the Chrome window and steals OS focus from the user's other work.
+  // Suppress them here (MAIN world) and hand any URL to the bridge to re-open as a BACKGROUND tab, so the
+  // provider capture that fed the popup still works without the focus theft. Gated on data-dhs-suppress-popups
+  // so normal browsing (and interactive single-listing investigation) is never affected.
+  const dhsPopupsSuppressed = () => {
+    try {
+      const root = document.documentElement;
+      return !!(root && root.getAttribute('data-dhs-suppress-popups') === '1');
+    } catch (_) { return false; }
+  };
+  // Only EXTERNAL (non-Naver) popups steal focus and are the provider pages we recapture in the background.
+  // Naver's own same-site popups/anchors are left completely alone so the region-selector restore and other
+  // in-flow clicks are never intercepted.
+  const dhsIsExternalUrl = (url) => {
+    const text = String(url || '');
+    if (!/^https?:\/\//i.test(text)) return false;
+    try { return !NAVER_HOSTS.has(new URL(text, location.href).hostname); } catch (_) { return false; }
+  };
+  const dhsHandOffPopup = (url) => {
+    if (!dhsIsExternalUrl(url)) return false;
+    try { window.postMessage({ source: SOURCE, type: 'DHS_SUPPRESSED_POPUP', url: String(url) }, '*'); } catch (_) {}
+    return true;
+  };
+  const nativeWindowOpen = window.open;
+  try {
+    window.open = function dhsGuardedWindowOpen(url) {
+      // Provider capture opens window.open('about:blank') then sets .location = <provider url>. Intercept
+      // both shapes: never create the active tab; hand any external URL to the extension for a background tab.
+      if (dhsPopupsSuppressed()) {
+        let handed = dhsHandOffPopup(url);
+        const loc = {};
+        const setHref = (v) => { if (!handed && dhsHandOffPopup(v)) handed = true; };
+        try {
+          Object.defineProperty(loc, 'href', { get() { return ''; }, set: setHref, configurable: true });
+        } catch (_) { loc.href = ''; }
+        loc.replace = setHref;
+        loc.assign = setHref;
+        return { closed: false, close() {}, focus() {}, blur() {}, postMessage() {}, location: loc, document: null };
+      }
+      return nativeWindowOpen.apply(this, arguments);
+    };
+  } catch (_) {}
+  // Capture-phase intercept ONLY for external target=_blank anchors (Naver's own anchors pass through).
+  window.addEventListener('click', (event) => {
+    if (!dhsPopupsSuppressed()) return;
+    let node = event.target;
+    for (let hops = 0; node && hops < 6; hops += 1, node = node.parentElement) {
+      if (node.tagName === 'A' && node.target && /_blank/i.test(node.target)) {
+        const href = node.getAttribute('href') || '';
+        if (dhsIsExternalUrl(href)) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          dhsHandOffPopup(href);
+        }
+        return;
+      }
+    }
+  }, true);
+
   emitUrlContext('hook-installed');
 })();

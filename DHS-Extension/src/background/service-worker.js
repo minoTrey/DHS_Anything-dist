@@ -5,7 +5,7 @@ importScripts('../shared/mk-provider-lookup.js');
 importScripts('../shared/naver-line-map.js');
 importScripts('../shared/building-units-resolver.js');
 
-globalThis.__DHS_SERVICE_WORKER_VERSION__ = '0.1.331';
+globalThis.__DHS_SERVICE_WORKER_VERSION__ = '0.1.332';
 const PROVIDER_SOURCE = 'DHS_ANYTHING_PROVIDER_CAPTURE';
 const BRIDGE_SOURCE = 'DHS_ANYTHING_CHROME_BRIDGE';
 const DEBUGGER_PROTOCOL_VERSION = '1.3';
@@ -15,12 +15,51 @@ const PROVIDER_TAB_CLOSE_AFTER_CANDIDATE_MS = 1200;
 const PROVIDER_REQUEST_TTL_MS = 2 * 60 * 1000;
 const PROVIDER_DIRECT_LOOKUP_TIMEOUT_MS = 6500;
 const PROVIDER_DIRECT_LOOKUP_MAX_BYTES = 600000;
+// Provider families whose http lookup ref must NOT be https-upgraded (see HTTP_UPGRADE in
+// sanitizeProviderLookupRef): mk uses an http article page; neonet's http rd.php?UID 302-redirects to
+// the https offerings SPA, whereas the https rd.php variant fails.
+const PROVIDER_HTTP_NO_UPGRADE_FAMILIES = new Set(['mk', 'neonet']);
 const FIN_FRONT_API_TIMEOUT_MS = 6500;
 const FIN_FRONT_API_BASE = 'https://fin.land.naver.com/front-api/v1';
 const REGION_EXPORT_MAX_CSV_BYTES = 8 * 1024 * 1024;
-const DHS_RUNTIME_SESSION_TOKEN = typeof crypto.randomUUID === 'function'
-  ? crypto.randomUUID()
-  : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+// The runtime-session token gates content-script re-injection: bridge.js re-initializes (disposing any
+// in-flight 지역추출) only when this token differs from the one the live bridge recorded. It MUST stay
+// stable across the MANY service-worker restarts MV3 performs while idle — otherwise every SW wake
+// re-injects bridge.js with a fresh random token and disposes a healthy running export ("추출하기 →
+// 바로 idle/종료"). So we PERSIST it and mint a new one ONLY on install/update/reload (onInstalled), i.e.
+// exactly when the content script's runtime context is genuinely new and the old bridge is dead.
+function dhsMakeSessionToken() {
+  return typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+let DHS_RUNTIME_SESSION_TOKEN = '';
+function dhsResolveSessionToken(callback) {
+  const done = (tok) => {
+    DHS_RUNTIME_SESSION_TOKEN = String(tok || DHS_RUNTIME_SESSION_TOKEN || dhsMakeSessionToken());
+    if (typeof callback === 'function') callback(DHS_RUNTIME_SESSION_TOKEN);
+  };
+  if (DHS_RUNTIME_SESSION_TOKEN) { done(DHS_RUNTIME_SESSION_TOKEN); return; }
+  try {
+    if (!chrome.storage || !chrome.storage.local) { done(dhsMakeSessionToken()); return; }
+    chrome.storage.local.get(['dhsRuntimeSessionToken'], (res) => {
+      void chrome.runtime.lastError;
+      let tok = res && res.dhsRuntimeSessionToken;
+      if (!tok) { tok = dhsMakeSessionToken(); try { chrome.storage.local.set({ dhsRuntimeSessionToken: tok }); } catch (_) {} }
+      done(tok);
+    });
+  } catch (_) { done(dhsMakeSessionToken()); }
+}
+function dhsMintNewSessionToken(callback) {
+  const tok = dhsMakeSessionToken();
+  DHS_RUNTIME_SESSION_TOKEN = tok;
+  try {
+    chrome.storage.local.set({ dhsRuntimeSessionToken: tok }, () => {
+      void chrome.runtime.lastError;
+      if (typeof callback === 'function') callback(tok);
+    });
+  } catch (_) { if (typeof callback === 'function') callback(tok); }
+}
 const providerStore = globalThis.DHS_PROVIDER_STORE.createProviderCandidateStore();
 let pendingProviderOpenerTabId = 0;
 let pendingProviderOpenerClearTimer = 0;
@@ -203,6 +242,9 @@ function executeDhsContentFiles(tabId, files, world) {
 function executeDhsIsolatedContentFiles(tabId, files) {
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== 'function') return;
   if (!tabId || !Array.isArray(files) || files.length === 0) return;
+  // Never inject with an unresolved (empty) token — that would look like a session change to a live
+  // bridge and dispose it. Resolve from storage first, then retry.
+  if (!DHS_RUNTIME_SESSION_TOKEN) { dhsResolveSessionToken(() => executeDhsIsolatedContentFiles(tabId, files)); return; }
   try {
     chrome.scripting.executeScript({
       target: { tabId },
@@ -303,20 +345,30 @@ function clearStaleDynamicContentScripts() {
   }
 }
 
-clearStaleDynamicContentScripts();
-injectDhsContentScriptsForExistingTabs();
+// Plain SW wake (ephemeral restart): reuse the PERSISTED token so re-injection matches the live bridge's
+// session and does NOT dispose a running export.
+dhsResolveSessionToken(() => {
+  clearStaleDynamicContentScripts();
+  injectDhsContentScriptsForExistingTabs();
+});
 
 if (chrome.runtime && chrome.runtime.onInstalled && typeof chrome.runtime.onInstalled.addListener === 'function') {
   chrome.runtime.onInstalled.addListener(() => {
-    clearStaleDynamicContentScripts();
-    injectDhsContentScriptsForExistingTabs();
+    // Genuinely new context (install/update/reload) → mint a fresh token so the freshly injected bridge
+    // replaces the now-dead old instance, THEN inject.
+    dhsMintNewSessionToken(() => {
+      clearStaleDynamicContentScripts();
+      injectDhsContentScriptsForExistingTabs();
+    });
   });
 }
 
 if (chrome.runtime && chrome.runtime.onStartup && typeof chrome.runtime.onStartup.addListener === 'function') {
   chrome.runtime.onStartup.addListener(() => {
-    clearStaleDynamicContentScripts();
-    injectDhsContentScriptsForExistingTabs();
+    dhsResolveSessionToken(() => {
+      clearStaleDynamicContentScripts();
+      injectDhsContentScriptsForExistingTabs();
+    });
   });
 }
 
@@ -625,6 +677,35 @@ function openProviderBackgroundTab(data, sender, sendResponse) {
   }
 }
 
+// Open a page-suppressed popup URL as a BACKGROUND tab (active:false) so it never raises/focuses the Chrome
+// window. Provider-capture content scripts (matched on provider hosts) read + auto-close it; as a backstop
+// we force-close after a short deadline so a non-provider URL can't leave a lingering tab.
+function openDhsBackgroundTab(data, sender, sendResponse) {
+  const openerTabId = Number(sender && sender.tab && sender.tab.id) || 0;
+  const url = String(data && data.url || '');
+  if (!/^https?:\/\//i.test(url) || !chrome.tabs || typeof chrome.tabs.create !== 'function') {
+    sendResponse({ ok: false, reason: 'background-tab-unavailable' });
+    return false;
+  }
+  try {
+    chrome.tabs.create({ url, active: false, openerTabId: openerTabId || undefined }, (tab) => {
+      if (chrome.runtime.lastError) { sendResponse({ ok: false, reason: 'background-tab-create-failed' }); return; }
+      const tabId = Number(tab && tab.id) || 0;
+      if (tabId) {
+        providerRequestTabIds.add(tabId);
+        // Provider capture closes it as soon as it reports; this is the safety-net close.
+        scheduleProviderTabIdClose(tabId, false);
+        setTimeout(() => { try { chrome.tabs.remove(tabId, () => void chrome.runtime.lastError); } catch (_) {} }, 25000);
+      }
+      sendResponse({ ok: true, status: 'background-tab-opened' });
+    });
+    return true;
+  } catch (_) {
+    sendResponse({ ok: false, reason: 'background-tab-error' });
+    return false;
+  }
+}
+
 function dispatchProviderClick(data, sender, sendResponse) {
   const tabId = sender && sender.tab && sender.tab.id;
   const x = coordinate(data && data.x);
@@ -725,6 +806,10 @@ function sanitizeProviderLookupRef(value, providerFamily) {
   }
   if (!['http:', 'https:'].includes(parsed.protocol)) return '';
   if (parsed.username || parsed.password) return '';
+  // HTTP_UPGRADE — most providers are https-only, so upgrade http refs. EXCEPT families whose http
+  // entry point is load-bearing: mk (land.mk http article) and neonet (http rd.php?UID 302-redirects
+  // to the https offerings SPA; the https rd.php variant fails). Keep those on http.
+  if (parsed.protocol === 'http:' && !PROVIDER_HTTP_NO_UPGRADE_FAMILIES.has(String(providerFamily || ''))) { parsed.protocol = 'https:'; }
   const family = String(providerFamily || '');
   const provider = directProviderFamilies().find((item) => (
     item.family === family &&
@@ -1357,6 +1442,17 @@ function runNaverFinFrontApiLookup(data, sendResponse) {
   return true;
 }
 
+function providerBodyIsLoginWall(bodyText, finalUrl) {
+  const url = String(finalUrl || '');
+  if (/\/(?:login|signin|sign_in|member\/log|auth\/log)(?:[/?.]|$)/i.test(url)) return true;
+  const text = String(bodyText || '');
+  if (/<input[^>]+type=["']password["']/i.test(text)) return true;
+  if (/name=["'](?:passwd|password|pwd|userpw|user_pwd|mem_pw|memberpw)["']/i.test(text)) return true;
+  const markers = [/Login\.neo/i, /login_check=yes/i, /return_url=/i, /\uC911\uAC1C\uD68C\uC6D0/, /\uAC1C\uC778\uD68C\uC6D0\s*\uAC00\uC785/, /ID\/PW/i, /\uB85C\uADF8\uC778\s*\uC720\uC9C0/, /\uC544\uC774\uB514\s*\uC800\uC7A5/, /\uB85C\uADF8\uC778\uC774\s*\uD544\uC694/];
+  const hits = markers.reduce((sum, re) => sum + (re.test(text) ? 1 : 0), 0);
+  return hits >= 2;
+}
+
 function runGenericProviderDirectLookup(providerFamily, providerLookupRef, data, sendResponse, lookupFetch) {
   const requestKey = String(data && data.requestKey || '');
   const articleMarker = String(data && data.articleMarker || '');
@@ -1387,6 +1483,24 @@ function runGenericProviderDirectLookup(providerFamily, providerLookupRef, data,
       bodyText: payload.text,
       listingContext: listingContextFromDirectLookup(data)
     });
+    const loginWall = !(observation && (observation.present || observation.floorHintPresent)) &&
+      providerBodyIsLoginWall(payload.text, payload.response && payload.response.url);
+    if (loginWall) {
+      sendResponse({
+        ok: false,
+        status: 'provider-login-required',
+        directLookupStatus: 'provider-login-required',
+        directLookupStep: 'provider-fetch',
+        providerFamily,
+        address2Seen: false,
+        candidatePresent: false,
+        floorHintPresent: false,
+        redirectStatus: Number(payload.response && payload.response.status || 0),
+        rejectReason: 'provider-login-required',
+        providerEvidenceSummary: providerStore.summary(articleMarker)
+      });
+      return;
+    }
     const status = payload.response && payload.response.ok ? 'no-candidate' : 'http-error';
     const bodyShape = observation && (observation.present || observation.floorHintPresent)
       ? 'known-structured'
@@ -1410,6 +1524,33 @@ function runGenericProviderDirectLookup(providerFamily, providerLookupRef, data,
       providerEvidenceSummary: providerStore.summary(articleMarker)
     });
   });
+  return true;
+}
+
+const PROVIDER_LOGIN_URLS = Object.freeze({
+  neonet: 'https://www.neonet.co.kr/novo-rebank/view/member/MemberLogin.neo',
+  serve: 'https://www.serve.co.kr/member/login',
+  rfine: 'https://www.rfine.kr/manage/login.php',
+  rter: 'https://rter2.com/',
+  ten: 'https://ten.co.kr/',
+  homesdid: 'https://homesdid.co.kr/'
+});
+
+function openProviderLoginTab(data, sender, sendResponse) {
+  const family = String(data && data.family || '');
+  const loginUrl = PROVIDER_LOGIN_URLS[family] || '';
+  if (!loginUrl || !providerFamilyKnown(family)) {
+    sendResponse({ ok: false, reason: 'unknown-login-family', family });
+    return false;
+  }
+  try {
+    chrome.tabs.create({ url: loginUrl, active: true }, (tab) => {
+      const err = chrome.runtime.lastError;
+      sendResponse({ ok: !err, family, loginUrl, tabId: tab && tab.id, reason: err ? String(err.message || err) : '' });
+    });
+  } catch (e) {
+    sendResponse({ ok: false, family, loginUrl, reason: String(e && e.message || e) });
+  }
   return true;
 }
 
@@ -1578,18 +1719,67 @@ function downloadRegionExportCsv(data, sender, sendResponse) {
     sendResponse({ ok: false, reason: !filename && !csvName ? 'invalid-filename' : 'invalid-payload' });
     return false;
   }
+  // Incremental region-export saves keep ONE file that updates each listing. We now WAIT for each download
+  // to finish (see tryDownload) so conflictAction:'overwrite' replaces the file in place — the file is
+  // always present (no delete-then-recreate gap) and the name stays stable. The earlier removeFile()
+  // approach deleted the previous file up front, which both flashed the file out of existence every save
+  // AND, when it hit a still-in-progress download, wedged Chrome's whole download manager. We only ERASE
+  // the previous list record (never the file) afterwards to keep the downloads list from piling up.
+  const replaceDownloadId = Math.max(0, Number(data && data.replaceDownloadId) || 0);
+  // Incremental/final region saves overwrite one file; diagnostic (no-rows/error) saves keep uniquify so
+  // they don't clobber the real data file.
+  const overwriteInPlace = Boolean(data && data.overwrite);
+  const erasePreviousRecord = () => {
+    if (!replaceDownloadId || !chrome.downloads || typeof chrome.downloads.erase !== 'function') return;
+    try { chrome.downloads.erase({ id: replaceDownloadId }, () => { void chrome.runtime.lastError; }); } catch (_) {}
+  };
+  // Resolve only when the download COMPLETES (not when it merely starts). The earlier version resolved on
+  // start, so the next incremental save's cleanupPrevious removeFile()'d a download that was still
+  // in_progress — which wedged Chrome's download manager (every later download stuck "in_progress" with an
+  // empty filename). Waiting for completion guarantees cleanupPrevious only ever touches a finished file
+  // and that at most one download is in flight at a time.
   const tryDownload = (url, name) => new Promise((resolve) => {
+    let did = 0;
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { chrome.downloads.onChanged.removeListener(onChanged); } catch (_) {}
+      resolve(value);
+    };
+    const onChanged = (delta) => {
+      if (!did || !delta || delta.id !== did || !delta.state) return;
+      if (delta.state.current === 'complete') finish(did);
+      else if (delta.state.current === 'interrupted') finish(null);
+    };
+    // Safety net: never wait forever for a download that never reports terminal state (kept under the
+    // content-script's own 15s wait so the SW always answers first).
+    const timer = setTimeout(() => finish(did || null), 12000);
     try {
+      if (chrome.downloads.onChanged && typeof chrome.downloads.onChanged.addListener === 'function') {
+        chrome.downloads.onChanged.addListener(onChanged);
+      }
       chrome.downloads.download({
         url,
         filename: `DHS/${name}`,
         saveAs: false,
-        conflictAction: 'uniquify'
+        conflictAction: overwriteInPlace ? 'overwrite' : 'uniquify'
       }, (downloadId) => {
-        resolve(chrome.runtime.lastError || !Number.isInteger(downloadId) ? null : downloadId);
+        if (chrome.runtime.lastError || !Number.isInteger(downloadId)) { finish(null); return; }
+        did = downloadId;
+        // Fast data: downloads can finish before the listener attaches — poll once to catch that.
+        try {
+          chrome.downloads.search({ id: did }, (items) => {
+            const item = items && items[0];
+            if (!item) return;
+            if (item.state === 'complete') finish(did);
+            else if (item.state === 'interrupted') finish(null);
+          });
+        } catch (_) {}
       });
     } catch (_) {
-      resolve(null);
+      finish(null);
     }
   });
   (async () => {
@@ -1599,6 +1789,7 @@ function downloadRegionExportCsv(data, sender, sendResponse) {
         filename
       );
       if (id !== null) {
+        erasePreviousRecord();
         sendResponse({ ok: true, downloadId: id, path: `Downloads/DHS/${filename}` });
         return;
       }
@@ -1606,6 +1797,7 @@ function downloadRegionExportCsv(data, sender, sendResponse) {
     if (csvOk) {
       const id = await tryDownload(`data:text/csv;charset=utf-8,${encodeURIComponent(csvText)}`, csvName);
       if (id !== null) {
+        erasePreviousRecord();
         sendResponse({ ok: true, downloadId: id, path: `Downloads/DHS/${csvName}` });
         return;
       }
@@ -1614,6 +1806,7 @@ function downloadRegionExportCsv(data, sender, sendResponse) {
   })();
   return true;
 }
+
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const data = message && typeof message === 'object' ? message : {};
@@ -1694,6 +1887,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (data.source === BRIDGE_SOURCE && data.type === 'OPEN_PROVIDER_BACKGROUND') {
     return openProviderBackgroundTab(data, sender, sendResponse);
+  }
+
+  if (data.source === BRIDGE_SOURCE && data.type === 'OPEN_PROVIDER_LOGIN') {
+    return openProviderLoginTab(data, sender, sendResponse);
+  }
+
+  if (data.source === BRIDGE_SOURCE && data.type === 'OPEN_BACKGROUND_TAB') {
+    return openDhsBackgroundTab(data, sender, sendResponse);
   }
 
   if (data.source === BRIDGE_SOURCE && data.type === 'NAVER_FIN_ARTICLE_LOOKUP') {

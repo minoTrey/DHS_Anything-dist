@@ -330,6 +330,13 @@
   display: none;
 }
 
+/* While the next level loads, keep the previous option buttons in place but dimmed + non-interactive,
+   so the 168px box does not collapse to a 1-row loading cell and flash "닫혔다 열렸다" on every drill. */
+#dhs-anything-diagnostic-overlay .dhs-region-options.is-loading {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
 #dhs-anything-diagnostic-overlay .dhs-region-option {
   min-height: 30px;
   padding: 5px 10px;

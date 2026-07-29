@@ -108,9 +108,10 @@
   const FIELD_SET = new Set(FIELD_NAMES.map((name) => name.toLowerCase()));
   const FLOOR_FIELD_SET = new Set(FLOOR_FIELD_NAMES.map((name) => name.toLowerCase()));
   const MK_VISIBLE_TEXT_FIELD = 'mk-visible-text';
+  const HOMESDID_VISIBLE_TEXT_FIELD = 'homesdid-visible-text';
   const PROVIDER_DEEP_SCAN_FIELD = 'provider-deep-scan';
   const VISIBLE_FLOOR_TEXT_FIELD = 'visible-floor-text';
-  const SOURCE_FIELDS = new Set(FIELD_NAMES.concat([MK_VISIBLE_TEXT_FIELD, PROVIDER_DEEP_SCAN_FIELD]));
+  const SOURCE_FIELDS = new Set(FIELD_NAMES.concat([MK_VISIBLE_TEXT_FIELD, HOMESDID_VISIBLE_TEXT_FIELD, PROVIDER_DEEP_SCAN_FIELD]));
   const FLOOR_SOURCE_FIELDS = new Set(FLOOR_FIELD_NAMES.concat([VISIBLE_FLOOR_TEXT_FIELD]));
   const FLOOR_TOTAL_FIELD_SET = new Set(['floor_cnt_total', 'floorcnttotal', 'buildinghighestfloor']);
   const FLOOR_NUMBER_ONLY_FIELD_SET = new Set([
@@ -374,7 +375,8 @@
   function allowsHoOnlyBandContext(candidateInput) {
     const sourceField = String(candidateInput && candidateInput.sourceField || '');
     const providerFamily = String(candidateInput && candidateInput.providerFamily || '');
-    return providerFamily === 'mk' && sourceField === MK_VISIBLE_TEXT_FIELD;
+    return (providerFamily === 'mk' && sourceField === MK_VISIBLE_TEXT_FIELD) ||
+      (providerFamily === 'homesdid' && sourceField === HOMESDID_VISIBLE_TEXT_FIELD);
   }
 
   function requiresExactFloorProviderContext(candidateInput) {
@@ -583,6 +585,15 @@
   function extractMkVisibleCandidate(bodyText) {
     const normalized = normalizeText(stripHtml(bodyText));
     return boundedDisplayCandidate(normalized);
+  }
+
+  function extractHomesdidVisibleCandidate(bodyText) {
+    const normalized = normalizeText(stripHtml(bodyText));
+    const both = boundedDisplayCandidate(normalized);
+    if (both) return both;
+    // Homes DID road-name legal address unit: '\uC81CN\uCE35 \uC81CNNN\uD638' -> ho-only
+    const m = normalized.match(new RegExp(`\\uC81C\\s*\\d{1,3}\\s*${FLOOR}\\s*\\uC81C?\\s*(\\d{2,4})\\s*${HO}`));
+    return m ? `${canonicalNumber(m[1])}${HO}` : '';
   }
 
   function boundedDisplayCandidate(value) {
@@ -1226,6 +1237,9 @@
     }
     if (providerFamily === 'mk') {
       pushCandidate(candidates, MK_VISIBLE_TEXT_FIELD, extractMkVisibleCandidate(bodyText));
+    }
+    if (providerFamily === 'homesdid') {
+      pushCandidate(candidates, HOMESDID_VISIBLE_TEXT_FIELD, extractHomesdidVisibleCandidate(bodyText), providerFamily, bodyText);
     }
     const deepScanDisplay = providerDeepScanCandidate(bodyText, effectiveFieldValues, input && input.listingContext);
     if (deepScanDisplay) {

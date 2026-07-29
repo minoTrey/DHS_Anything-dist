@@ -44,6 +44,11 @@
   const REGION_EXPORT_SCROLL_SETTLE_MS = 450;
   const REGION_EXPORT_MAX_SCROLL_ROUNDS = 80;
   const REGION_EXPORT_COMPLEX_SETTLE_MS = 650;
+  // Max wait for a trusted-click SW response before the extraction gives up on that click and falls back,
+  // so a torn-down worker / stalled debugger command can never freeze the whole run on one listing.
+  const REGION_EXPORT_TRUSTED_CLICK_TIMEOUT_MS = 20000;
+  // Min gap between incremental file rewrites (coalesces rapid per-listing saves into one live-ish write).
+  const REGION_EXPORT_SAVE_MIN_INTERVAL_MS = 2500;
   const REGION_EXPORT_SELECTOR_SETTLE_MS = 180;
   const REGION_EXPORT_COMPLEX_SCROLL_SETTLE_MS = 350;
   const REGION_EXPORT_COMPLEX_MAX_SCROLL_ROUNDS = 80;
@@ -214,10 +219,21 @@
   const runtimeSession = String(window.__DHS_ANYTHING_RUNTIME_SESSION__ || '');
   const existingBridgeVersion = String(window.__DHS_ANYTHING_CHROME_BRIDGE__ || '');
   const existingBridgeSession = String(window.__DHS_ANYTHING_CHROME_BRIDGE_SESSION__ || '');
+  // A plain MV3 service-worker restart re-injects this file while the previous bridge is STILL ALIVE and
+  // may be mid-지역추출. The old guard disposed it whenever the SW's random session token differed — which
+  // it does on EVERY SW restart — killing the run ("추출하기 → 바로 idle/종료"). Liveness is the correct,
+  // token-independent signal: a SW restart does NOT invalidate a content script's runtime, but an
+  // extension reload/update DOES. So keep the existing bridge when it is same-or-newer version AND still
+  // live; only re-init when it is genuinely dead (reload/update) or older.
+  let existingBridgeAlive = false;
+  try {
+    const existingPing = window.__DHS_ANYTHING_CHROME_BRIDGE_PING__;
+    existingBridgeAlive = typeof existingPing === 'function' && existingPing() === true;
+  } catch (_e) { existingBridgeAlive = false; }
   if (
     existingBridgeVersion
     && isSameOrNewerVersion(existingBridgeVersion, VERSION)
-    && existingBridgeSession === runtimeSession
+    && existingBridgeAlive
   ) return;
   const previousBridgeDispose = window.__DHS_ANYTHING_CHROME_BRIDGE_DISPOSE__;
   if (typeof previousBridgeDispose === 'function') {
@@ -229,6 +245,12 @@
   if (staleRegionShield) staleRegionShield.remove();
   window.__DHS_ANYTHING_CHROME_BRIDGE__ = VERSION;
   window.__DHS_ANYTHING_CHROME_BRIDGE_SESSION__ = runtimeSession;
+  // Liveness beacon read by any later re-injection's guard: true only while THIS bridge's extension
+  // runtime is still valid. A SW restart leaves it true (keep me); an extension reload/update makes
+  // chrome.runtime.id undefined (dispose me). Captures this instance's chrome reference by closure.
+  window.__DHS_ANYTHING_CHROME_BRIDGE_PING__ = function () {
+    try { return Boolean(chrome && chrome.runtime && chrome.runtime.id); } catch (_) { return false; }
+  };
 
   const state = {
     diagnosis: 'waiting',
@@ -655,6 +677,15 @@
   let regionExportShieldClickThroughDepth = 0;
   let lastRegionExportHeartbeatAt = 0;
   let regionExportInProgressRows = [];
+  // Naver Bearer token forwarded from the MAIN-world hook; used by the API-driven region collector.
+  let naverApiAuthHeader = '';
+  // Incremental auto-save: the run creates ONE file up front and overwrites it after every listing so a
+  // crash/停止 never loses collected rows and the file grows live. Coalesced to one in-flight save.
+  let regionExportSaveBaseName = '';
+  let regionExportIncrementalDownloadId = 0;
+  let regionExportIncrementalSaving = false;
+  let regionExportIncrementalPending = false;
+  let regionExportLastIncrementalSaveAt = 0;
   let regionExportRunId = 0;
   let regionExportMarkerNoncePromise = null;
   let regionExportResumeRegionKey = '';
@@ -2766,6 +2797,622 @@
     return list;
   }
 
+  // ── API-driven region collection ──────────────────────────────────────────────────────────────────
+  // Replaces the slow UI-driven walk (scroll list + click each listing) with the same direct Naver API
+  // calls the mature CLI exporter uses: fetch every complex in the 동, then every article per complex.
+  // No per-listing navigation → hundreds of ms instead of ~48s per listing.
+  const REGION_API_REALESTATE_TYPE = 'APT:ABYG:JGC:PRE';
+  const REGION_API_MAX_PAGES = 40;
+
+  async function fetchNaverApiJson(path) {
+    const headers = { accept: 'application/json, text/plain, */*' };
+    if (naverApiAuthHeader) headers.authorization = naverApiAuthHeader;
+    const resp = await fetch(path, { credentials: 'include', headers });
+    if (!resp.ok) throw new Error('naver-api-http-' + resp.status);
+    return resp.json();
+  }
+
+  async function fetchRegionComplexesViaApi(cortarNo) {
+    const j = await fetchNaverApiJson(
+      '/api/regions/complexes?cortarNo=' + encodeURIComponent(cortarNo)
+      + '&realEstateType=' + encodeURIComponent(REGION_API_REALESTATE_TYPE) + '&order='
+    );
+    return Array.isArray(j && j.complexList) ? j.complexList : [];
+  }
+
+  function buildComplexArticlePath(complexNo, page, sameAddressGroup) {
+    return '/api/articles/complex/' + encodeURIComponent(complexNo) + '?' + new URLSearchParams({
+      realEstateType: REGION_API_REALESTATE_TYPE, tradeType: '', tag: '',
+      rentPriceMin: '0', rentPriceMax: '900000000', priceMin: '0', priceMax: '900000000',
+      areaMin: '0', areaMax: '900000000', oldBuildYears: '', recentlyBuildYears: '',
+      minHouseHoldCount: '', maxHouseHoldCount: '', showArticle: 'false',
+      sameAddressGroup: String(Boolean(sameAddressGroup)), minMaintenanceCost: '', maxMaintenanceCost: '',
+      priceType: 'RETAIL', directions: '', page: String(page), complexNo: String(complexNo),
+      buildingNos: '', areaNos: '', type: 'list', order: 'rank'
+    }).toString();
+  }
+
+  async function fetchComplexArticlesViaApi(complexNo) {
+    const all = [];
+    for (let page = 1; page <= REGION_API_MAX_PAGES; page += 1) {
+      const j = await fetchNaverApiJson(buildComplexArticlePath(complexNo, page, true));
+      const list = Array.isArray(j && j.articleList) ? j.articleList : [];
+      all.push(...list);
+      if (!j || j.isMoreData !== true || !list.length) break;
+      await delayMs(100);
+    }
+    return all;
+  }
+
+  // Collect every article across every complex in the 동 via API. Returns raw articles; dedup + 호수
+  // resolution + row shaping happen in later phases.
+  async function collectRegionListingsViaApi(cortarNo, runId) {
+    const complexes = await fetchRegionComplexesViaApi(cortarNo);
+    const listings = [];
+    for (const complex of complexes) {
+      if (runId && runId !== regionExportRunId) break;
+      const complexNo = String(complex && complex.complexNo || '');
+      if (!complexNo) continue;
+      let articles = [];
+      try { articles = await fetchComplexArticlesViaApi(complexNo); } catch (_) { articles = []; }
+      for (const article of articles) {
+        listings.push({ complexNo, complexName: String(complex.complexName || ''), article });
+      }
+      await delayMs(60);
+    }
+    return { complexCount: complexes.length, listings };
+  }
+
+  // ── Phase 2: dedup + 동일매물 collapse (ported from CLI regionScanDuplicateKey) ──────────────────────
+  // Two listings for the SAME unit (same complex/동/거래/가격/면적/층/방향) are duplicates — the same
+  // physical listing surfaced by multiple brokers. Keep the first, drop the rest. Association-provider
+  // rows (한국공인중개사협회 등) are excluded like the CLI tool does.
+  function regionApiListingDuplicateKey(complexNo, article) {
+    const a = article || {};
+    const dong = normalizeText(a.buildingName || a.dongName || a.dongNo || a.buildingNo);
+    const trade = normalizeText(a.tradeTypeName);
+    const price = normalizeText(a.rentPrc ? (a.dealOrWarrantPrc + '/' + a.rentPrc) : a.dealOrWarrantPrc);
+    const area = normalizeText(a.areaName || [a.area1, a.area2].filter((v) => v !== '' && v != null).join('/'));
+    const floor = normalizeText(a.floorInfo);
+    const direction = normalizeText(a.direction);
+    const required = [String(complexNo || ''), dong, trade, price, area, floor, direction];
+    if (required.some((v) => !v)) return ''; // incomplete → treat as unique (can't safely merge)
+    return required.map((v) => v.replace(/\s+/g, '')).join('|');
+  }
+
+  function isExcludedAssociationProviderArticle(article) {
+    const a = article || {};
+    const text = normalizeText([a.cpName, a.articleFeatureDesc, a.articleSummary, a.providerName].filter(Boolean).join(' '));
+    return /한국공인중개사협회|공인중개사협회|부동산협회/.test(text);
+  }
+
+  function dedupeRegionApiListings(listings) {
+    const seen = new Map();          // scanKey → representative item (for 호수 propagation later)
+    const unique = [];
+    let assocDropped = 0;
+    let dupDropped = 0;
+    for (const item of (Array.isArray(listings) ? listings : [])) {
+      if (isExcludedAssociationProviderArticle(item.article)) { assocDropped += 1; continue; }
+      const key = regionApiListingDuplicateKey(item.complexNo, item.article);
+      if (key) {
+        if (seen.has(key)) { dupDropped += 1; continue; } // duplicate of an existing target → skip from resolution
+        seen.set(key, item);
+      }
+      unique.push(item);
+    }
+    return { unique, assocDropped, dupDropped, dropped: assocDropped + dupDropped };
+  }
+
+  // Unit identity for cross-trade grouping: the SAME physical 호실 listed as 매매 + 전세 + 월세 shares
+  // 단지·동·면적·층·방향 (trade/price differ). 호수 is a property of the unit, not the trade — so resolve
+  // ONCE per unit and emit ONE combined row. Empty fields → unique (fall back to articleNo, never merge).
+  function regionApiUnitKey(complexNo, article, exactFloor) {
+    const a = article || {};
+    const dong = normalizeText(a.buildingName || a.dongName || a.dongNo || a.buildingNo);
+    const area = normalizeText(a.areaName || [a.area1, a.area2].filter((v) => v !== '' && v != null).join('/'));
+    // Prefer exact floor (from article detail) over the list floorInfo band ("중/16") — band over-merges
+    // distinct units on different floors. Fall back to the band only when detail is unavailable.
+    const floor = (Number(exactFloor) > 0) ? String(Number(exactFloor)) : normalizeText(a.floorInfo);
+    const direction = normalizeText(a.direction);
+    const required = [String(complexNo || ''), dong, area, floor, direction];
+    if (required.some((v) => !v)) return '';
+    return required.map((v) => v.replace(/\s+/g, '')).join('|');
+  }
+
+  // Fetch a single article's detail → exact floor (correspondingFloorCount, NOT a band), buildNo, exclusive
+  // area. This is the per-listing cost that makes unit grouping correct + provides the exact floor for output.
+  async function fetchArticleDetailInfo(articleNo, complexNo) {
+    if (!articleNo) return null;
+    let body;
+    try {
+      body = await fetchNaverApiJson('/api/articles/' + encodeURIComponent(articleNo)
+        + (complexNo ? ('?complexNo=' + encodeURIComponent(complexNo)) : ''));
+    } catch (_) { return null; }
+    if (!body || typeof body !== 'object') return null;
+    const af = body.articleFloor || {};
+    const ad = body.articleDetail || {};
+    const asp = body.articleSpace || {};
+    return {
+      exactFloor: Number(af.correspondingFloorCount) || 0,
+      totalFloor: Number(af.totalFloorCount) || 0,
+      buildNo: String(ad.buildNo || ad.buildingNo || ''),
+      ptpNo: String(ad.ptpNo || ''),
+      exclusiveSpace: Number(asp.exclusiveSpace || 0) || 0,
+      hasBuildingUnitInfo: Boolean(ad.hasBuildingUnitInfo)
+    };
+  }
+
+  // Fetch exact floor per deduped listing, then group into physical units by 동·면적·정확층·방향.
+  async function buildRegionUnitGroupsWithDetail(unique, opts) {
+    const options = opts || {};
+    const items = Array.isArray(unique) ? unique : [];
+    let detailFetched = 0; let detailFailed = 0; let exactFloorCount = 0;
+    const withFloor = [];
+    for (const item of items) {
+      const a = item.article || {};
+      const det = await fetchArticleDetailInfo(a.articleNo, item.complexNo);
+      if (det) { detailFetched += 1; if (det.exactFloor > 0) exactFloorCount += 1; } else { detailFailed += 1; }
+      withFloor.push({ item, exactFloor: det ? det.exactFloor : 0, totalFloor: det ? det.totalFloor : 0,
+        buildNo: det ? det.buildNo : '', exclusiveSpace: det ? det.exclusiveSpace : 0 });
+      if (options.delayMs) await delayMs(options.delayMs);
+    }
+    const groups = [];
+    const byKey = new Map();
+    for (const wf of withFloor) {
+      const item = wf.item; const a = item.article || {};
+      const key = regionApiUnitKey(item.complexNo, a, wf.exactFloor);
+      const tradeEntry = { tradeTypeName: normalizeText(a.tradeTypeName),
+        price: normalizeText(a.rentPrc ? (a.dealOrWarrantPrc + '/' + a.rentPrc) : a.dealOrWarrantPrc) };
+      if (key && byKey.has(key)) { const g = byKey.get(key); g.members.push(wf); g.trades.push(tradeEntry); continue; }
+      const group = { complexNo: item.complexNo, complexName: item.complexName, unitKey: key, article: a,
+        exactFloor: wf.exactFloor, totalFloor: wf.totalFloor, buildNo: wf.buildNo, members: [wf], trades: [tradeEntry] };
+      groups.push(group);
+      if (key) byKey.set(key, group);
+    }
+    let multiTradeGroups = 0;
+    for (const g of groups) {
+      const d = new Set(g.trades.map((t) => t.tradeTypeName).filter(Boolean));
+      g.distinctTradeCount = d.size;
+      if (d.size >= 2) multiTradeGroups += 1;
+    }
+    return { groups, multiTradeGroups, detailFetched, detailFailed, exactFloorCount };
+  }
+
+  // Group the deduped listing list into physical units (merging cross-trade listings of the same 호실).
+  // Each group → one resolution target + one output row. Non-groupable (empty key) stays standalone.
+  function groupRegionListingsByUnit(unique) {
+    const groups = [];
+    const byKey = new Map();
+    for (const item of (Array.isArray(unique) ? unique : [])) {
+      const key = regionApiUnitKey(item.complexNo, item.article);
+      const a = item.article || {};
+      const tradeEntry = {
+        tradeTypeName: normalizeText(a.tradeTypeName),
+        price: normalizeText(a.rentPrc ? (a.dealOrWarrantPrc + '/' + a.rentPrc) : a.dealOrWarrantPrc)
+      };
+      if (key && byKey.has(key)) {
+        const g = byKey.get(key);
+        g.members.push(item);
+        g.trades.push(tradeEntry);
+        continue;
+      }
+      const group = { complexNo: item.complexNo, complexName: item.complexName, unitKey: key,
+        article: a, members: [item], trades: [tradeEntry] };
+      groups.push(group);
+      if (key) byKey.set(key, group);
+    }
+    // Distinct trade-type count per group (for reporting how many multi-trade units were merged).
+    let multiTradeGroups = 0;
+    for (const g of groups) {
+      const distinct = new Set(g.trades.map((t) => t.tradeTypeName).filter(Boolean));
+      g.distinctTradeCount = distinct.size;
+      if (distinct.size >= 2) multiTradeGroups += 1;
+    }
+    return { groups, multiTradeGroups };
+  }
+
+  // Summarize the resolution-target list (what will actually be sent to providers) for review.
+  function summarizeRegionTargetList(unique) {
+    const byTrade = {};
+    const byComplex = {};
+    const byProvider = {};        // cpName → count (which broker/CP posted the listing)
+    const byCpid = {};            // cpid → count
+    const samples = [];
+    let addrVisible = 0;          // detailAddressYn === 'Y' → 호(주소) 노출 = visible-ho 후보
+    let cpUrlPresent = 0;         // has a provider article URL to resolve from
+    for (const item of (Array.isArray(unique) ? unique : [])) {
+      const a = item.article || {};
+      const trade = normalizeText(a.tradeTypeName) || '(미상)';
+      byTrade[trade] = (byTrade[trade] || 0) + 1;
+      const cx = item.complexName || item.complexNo || '(미상)';
+      byComplex[cx] = (byComplex[cx] || 0) + 1;
+      const cp = normalizeText(a.cpName) || '(없음)';
+      byProvider[cp] = (byProvider[cp] || 0) + 1;
+      const cpid = normalizeText(a.cpid) || '(없음)';
+      byCpid[cpid] = (byCpid[cpid] || 0) + 1;
+      if (normalizeText(a.detailAddressYn) === 'Y') addrVisible += 1;
+      if (a.cpPcArticleUrl || a.cpMobileArticleUrl) cpUrlPresent += 1;
+      if (samples.length < 10) samples.push({ complex: item.complexName, dong: a.buildingName, trade, price: a.rentPrc ? (a.dealOrWarrantPrc + '/' + a.rentPrc) : a.dealOrWarrantPrc, area: a.areaName, floor: a.floorInfo, dir: a.direction });
+    }
+    const topN = (obj, n) => Object.entries(obj).sort((x, y) => y[1] - x[1]).slice(0, n).map(([k, v]) => k + ':' + v);
+    const total = (unique || []).length;
+    return { targetTotal: total, byTrade, complexCount: Object.keys(byComplex).length, topComplexes: topN(byComplex, 8),
+      topProviders: topN(byProvider, 15), topCpids: topN(byCpid, 15),
+      addrVisible, addrVisiblePct: total ? Math.round(addrVisible / total * 100) : 0,
+      cpUrlPresent, cpUrlPresentPct: total ? Math.round(cpUrlPresent / total * 100) : 0, samples };
+  }
+
+  // ── Phase 3: 호수 resolution (provider-free first) ─────────────────────────────────────────────────
+  // Hybrid strategy: resolve exact 호수 from Naver API data + building-unit maps (no external provider
+  // sites). Strongest path = buildingUnits (article linked directly to a unit; no exact floor needed).
+  // Fallback = line inference from pyeongtype/landprice maps. Listings still unresolved here are the
+  // ones that would need a provider lookup (done separately, sequentially, in the slow hybrid tail).
+
+  // Article-list floorInfo is like "중/16" or "12/16" (band-or-exact / totalFloor) WITHOUT a 층 suffix,
+  // so classifyFloor() (which expects 층) can't parse it — dedicated parser here.
+  function regionApiParseFloorInfo(floorInfo) {
+    const s = normalizeText(floorInfo);
+    const m = s.match(/^(\S+?)\s*\/\s*(\d{1,3})/);
+    const total = m ? (Number(m[2]) || 0) : 0;
+    const head = m ? m[1] : s;
+    if (/^\d+$/.test(head)) return { floorKind: 'exact', floorValue: Number(head) || 0, floorBand: '', totalFloor: total };
+    const bandMap = { '저': 'low', '중': 'mid', '고': 'high' };
+    const band = bandMap[head] || '';
+    return { floorKind: band ? 'band' : 'none', floorValue: 0, floorBand: band, totalFloor: total };
+  }
+
+  // Build a clean per-article resolution context (both plain + detail* variants) directly from API data,
+  // WITHOUT reading `state` (which holds only the single currently-open article and would contaminate).
+  function regionApiResolveContext(complexNo, article, dongInfo) {
+    const a = article || {};
+    const dongTok = extractDongToken(a.buildingName || a.dongName || '') || normalizeText(a.buildingName);
+    const typeTok = extractDetailTypeToken(a.areaName || '') || normalizeText(a.areaName);
+    const fl = regionApiParseFloorInfo(a.floorInfo);
+    const bu = window.DHS_BUILDING_UNITS_RESOLVER;
+    const marker = (bu && typeof bu.hashArticleMarker === 'function') ? bu.hashArticleMarker(String(a.articleNo || '')) : '';
+    const exclusive = Number(a.area2 || 0) || 0;
+    const direction = normalizeText(a.direction);
+    return {
+      dongToken: dongTok, typeToken: typeTok,
+      floorValue: fl.floorValue, floorBand: fl.floorBand, totalFloor: fl.totalFloor,
+      floorKind: fl.floorKind, exclusiveSpace: exclusive, pyeongNo: '',
+      direction, directionToken: direction,
+      detailDongToken: dongTok, detailTypeToken: typeTok,
+      detailFloorValue: fl.floorValue, detailFloorBand: fl.floorBand, detailFloorKind: fl.floorKind,
+      detailTotalFloor: fl.totalFloor, detailExclusiveSpace: exclusive, detailPyeongNo: '',
+      detailBuildNo: dongInfo ? dongInfo.buildNo : '', detailDongNo: dongInfo ? dongInfo.dongNo : '',
+      detailDisplayDongToken: dongTok, articleMarker: marker
+    };
+  }
+
+  // Map each 동 (display token like "116동") → { dongNo, buildNo } for a complex. The dong→dongNo table
+  // lives in /api/complexes/{no}/buildings (buildingList[].bildName/dongNo); /api/complexes/{no} does NOT
+  // carry it. dongNo is required by the pyeongtype/landprice endpoints that feed line inference — without
+  // it those endpoints return an error body (no line map, so no 후보 candidates).
+  async function fetchComplexDongMap(complexNo) {
+    let body;
+    try { body = await fetchNaverApiJson('/api/complexes/' + encodeURIComponent(complexNo) + '/buildings'); }
+    catch (_) { return new Map(); }
+    const map = new Map();
+    const list = (body && (Array.isArray(body.buildingList) ? body.buildingList : (Array.isArray(body) ? body : []))) || [];
+    for (const item of list.slice(0, 1000)) {
+      if (!item || typeof item !== 'object') continue;
+      const name = String(item.bildName || item.dongName || item.buildingName || item.dongNm || '').trim();
+      const dongNo = String(item.dongNo || item.dongNumber || '');
+      const buildNo = String(item.buildNo || item.buildingNo || item.bildNo || '');
+      // bildName is bare ("116") so append 동 for extractDongToken; fall back to a numeric token.
+      const tok = extractDongToken(name + DONG) || (/^\d{1,4}$/.test(name) ? (Number(name) + DONG) : (name ? normalizeText(name) : ''));
+      if (tok && dongNo && !map.has(tok)) map.set(tok, { dongNo, buildNo });
+    }
+    return map;
+  }
+
+  async function fetchBuildingUnitsBody(buildNo) {
+    try { return await fetchNaverApiJson('/api/articles/buildings/units?buildingNos=' + encodeURIComponent(buildNo)); }
+    catch (_) { return null; }
+  }
+  async function fetchComplexPyeongTypeBody(complexNo, dongNo) {
+    const q = dongNo ? ('?dongNo=' + encodeURIComponent(dongNo)) : '';
+    try { return await fetchNaverApiJson('/api/complexes/' + encodeURIComponent(complexNo) + '/buildings/pyeongtype' + q); }
+    catch (_) { return null; }
+  }
+  async function fetchComplexLandPriceBody(complexNo, dongNo) {
+    const q = dongNo ? ('?dongNo=' + encodeURIComponent(dongNo)) : '';
+    try { return await fetchNaverApiJson('/api/complexes/' + encodeURIComponent(complexNo) + '/buildings/landprice' + q); }
+    catch (_) { return null; }
+  }
+
+  // Resolve 호수 for listings WITHOUT providers. Measures provider-free yield (buildingUnits vs line
+  // inference vs unresolved). `sampleLimit` caps how many listings to probe for a quick measurement.
+  async function resolveRegionListingsViaApi(listings, opts) {
+    const options = opts || {};
+    const items = Array.isArray(listings) ? listings : [];
+    const limit = Number(options.sampleLimit || 0) || items.length;
+    const bu = window.DHS_BUILDING_UNITS_RESOLVER;
+    const li = window.DHS_LINE_INFERENCE;
+    const nlm = window.DHS_NAVER_LINE_MAP;
+    const stats = { total: 0, buildingUnits: 0, lineInference: 0, unresolved: 0,
+      noDongMap: 0, noBuildNo: 0, errors: 0, complexesProbed: 0, liStatuses: {} };
+    const dongMapCache = new Map();   // complexNo → Map(dongTok → {dongNo,buildNo})
+    const unitsCache = new Map();     // buildNo → body
+    const lineMapCache = new Map();   // complexNo|dongNo → accumulated line-map rows
+    const samples = [];
+    let debugOnce = null;
+    for (let i = 0; i < items.length && i < limit; i += 1) {
+      const item = items[i] || {};
+      stats.total += 1;
+      try {
+        const complexNo = String(item.complexNo || '');
+        if (!dongMapCache.has(complexNo)) { dongMapCache.set(complexNo, await fetchComplexDongMap(complexNo)); stats.complexesProbed += 1; }
+        const dongMap = dongMapCache.get(complexNo);
+        if (!dongMap.size) stats.noDongMap += 1;
+        const ctx = regionApiResolveContext(complexNo, item.article, null);
+        const dongInfo = dongMap.get(ctx.detailDongToken) || null;
+        if (dongInfo) { ctx.detailBuildNo = dongInfo.buildNo; ctx.detailDongNo = dongInfo.dongNo; ctx.detailDisplayDongToken = ctx.detailDongToken; }
+        else stats.noBuildNo += 1;
+
+        let display = ''; let proofSource = '';
+
+        // Path 1: buildingUnits (strongest, provider-free, no exact floor required).
+        if (dongInfo && dongInfo.buildNo && bu && typeof bu.resolveBuildingUnitsExact === 'function') {
+          if (!unitsCache.has(dongInfo.buildNo)) unitsCache.set(dongInfo.buildNo, await fetchBuildingUnitsBody(dongInfo.buildNo));
+          const body = unitsCache.get(dongInfo.buildNo);
+          if (body && !debugOnce) debugOnce = { unitsBodyKeys: Object.keys(body).slice(0, 12), dongMapSize: dongMap.size, sampleDongTok: ctx.detailDongToken, hasDongInfo: true };
+          if (body) {
+            const r = bu.resolveBuildingUnitsExact(body, ctx);
+            if (r && r.present && r.displayCandidate) { display = r.displayCandidate; proofSource = 'buildingUnits'; }
+          }
+        }
+
+        // Path 2: line inference from pyeongtype/landprice maps.
+        if (!display && li && nlm && typeof li.buildLineInference === 'function' && typeof nlm.collectNaverLineMapRows === 'function') {
+          const dongNo = dongInfo ? dongInfo.dongNo : '';
+          const cacheKey = complexNo + '|' + dongNo;
+          if (!lineMapCache.has(cacheKey)) {
+            let rows = [];
+            const pt = await fetchComplexPyeongTypeBody(complexNo, dongNo);
+            if (pt) rows = rows.concat(nlm.collectNaverLineMapRows(pt, ctx) || []);
+            const lp = await fetchComplexLandPriceBody(complexNo, dongNo);
+            if (lp) rows = rows.concat(nlm.collectNaverLineMapRows(lp, ctx) || []);
+            lineMapCache.set(cacheKey, rows);
+          }
+          const lineMapRows = lineMapCache.get(cacheKey) || [];
+          if (lineMapRows.length) {
+            const inf = li.buildLineInference({ lineMapRows, context: ctx });
+            const st = inf && inf.status || 'none';
+            stats.liStatuses[st] = (stats.liStatuses[st] || 0) + 1;
+            if (inf && inf.status === 'single-estimated' && Number(inf.candidateCount || 0) === 1 && inf.displayCandidate) {
+              display = inf.displayCandidate; proofSource = 'lineInference';
+            }
+          }
+        }
+
+        if (proofSource === 'buildingUnits') stats.buildingUnits += 1;
+        else if (proofSource === 'lineInference') stats.lineInference += 1;
+        else stats.unresolved += 1;
+
+        if (display && samples.length < 8) {
+          const a = item.article || {};
+          samples.push({ complex: item.complexName, dong: a.buildingName, floor: a.floorInfo, area: a.areaName, ho: display, via: proofSource });
+        }
+      } catch (_) { stats.errors += 1; }
+    }
+    return { stats, samples, debug: debugOnce };
+  }
+
+  // ── Provider(제공처) 호수 resolver wired to API data (no Naver UI navigation) ────────────────────────
+  // Reuses the SW provider pipeline (BEGIN_PROVIDER_REQUEST → PROVIDER_DIRECT_LOOKUP → GET_PROVIDER_CANDIDATE),
+  // but populates every field from API-derived context (regionApiResolveContext) INSTEAD of state.*. The
+  // provider store is single-flight, so callers MUST serialize (one article fully resolved before the next).
+  function providerResolveSendMessage(message, timeoutMs) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (r) => { if (settled) return; settled = true; resolve(r); };
+      const timer = window.setTimeout(() => finish({ __timeout: true }), Number(timeoutMs || 15000));
+      const dispatched = safeRuntimeSendMessage(message, (response) => { window.clearTimeout(timer); finish(response || null); });
+      if (dispatched === false) { window.clearTimeout(timer); finish(null); }
+    });
+  }
+
+  // Capture-tier providers: direct fetch can't reach the 호수 (JS-rendered SPA), so the API resolver
+  // falls back to a background-tab capture. Neonet at minimum (http rd.php?UID → https offerings SPA).
+  const PROVIDER_CAPTURE_TAB_FAMILIES = new Set(['neonet']);
+  const PROVIDER_CAPTURE_TAB_POLL_ATTEMPTS = 24;      // × interval ≈ max wait for SPA render + capture
+  const PROVIDER_CAPTURE_TAB_POLL_INTERVAL_MS = 600;  // 24 × 600ms ≈ 14.4s
+
+  // Resolve ONE listing's 호수 purely from provider data. Returns
+  // { ho: acceptedDisplay||'', rawHo: providerRevealedDisplay||'', proofSource, family, ok, reason }.
+  async function resolveOneListingViaProvider(complexNo, article) {
+    const a = article || {};
+    const out = { ho: '', rawHo: '', proofSource: '', family: '', ok: false, reason: '', loginRequired: false, captureTab: '' };
+    const articleNo = String(a.articleNo || '');
+    if (!articleNo) { out.reason = 'missing-article-no'; return out; }
+    const bu = window.DHS_BUILDING_UNITS_RESOLVER;
+    const inv = window.DHS_CP_INVENTORY;
+    const capi = providerCandidateApi();
+    const marker = (bu && typeof bu.hashArticleMarker === 'function') ? bu.hashArticleMarker(articleNo) : '';
+    if (!/^article:[a-f0-9]{8,12}$/.test(marker)) { out.reason = 'missing-marker'; return out; }
+    const cpidRaw = String(a.cpid || '');
+    const familyMap = (inv && inv.DIRECT_CPID_FAMILY_MAP) || {};
+    const family = familyMap[cpidRaw] || familyMap[cpidRaw.toLowerCase()] || familyMap[cpidRaw.toUpperCase()] || '';
+    out.family = family;
+    if (!family) { out.reason = 'unmapped-cpid'; return out; }
+    const providerUrl = sanitizeProviderLookupRef(a.cpPcArticleUrl || a.cpMobileArticleUrl || '');
+    const ctx = regionApiResolveContext(String(complexNo || ''), a, null);
+    const listingContext = {
+      detailDongToken: ctx.detailDongToken,
+      detailTypeToken: ctx.detailTypeToken,
+      detailDirectionToken: ctx.detailDirectionToken || ctx.directionToken,
+      detailFloorKind: ctx.detailFloorKind,
+      detailFloorBand: ctx.detailFloorBand,
+      detailFloorValue: ctx.detailFloorValue,
+      detailTotalFloor: ctx.detailTotalFloor,
+      detailExclusiveSpace: ctx.detailExclusiveSpace,
+      lineCandidateDisplays: []
+    };
+    // 1) BEGIN — establishes the single-flight pending request + requestKey.
+    const begin = await providerResolveSendMessage({
+      source: BRIDGE_SOURCE, type: 'BEGIN_PROVIDER_REQUEST', version: VERSION,
+      articleMarker: marker, listingContext,
+      targetPhase: 'direct-provider', targetIndex: 0, targetCount: 1, targetFamily: family
+    }, 15000);
+    if (!begin || !begin.ok || !begin.requestKey) { out.reason = 'begin-' + (begin && begin.__timeout ? 'timeout' : 'failed'); return out; }
+    const requestKey = String(begin.requestKey);
+    // 2) DIRECT LOOKUP — MK uses mk-uid (UID == Naver articleNo); everyone else uses provider-url.
+    const isMk = family === 'mk';
+    const lookupMsg = {
+      source: BRIDGE_SOURCE, type: 'PROVIDER_DIRECT_LOOKUP', version: VERSION,
+      articleMarker: marker, requestKey, providerFamily: family,
+      providerLookupArticleMarker: marker, providerLookupGroupProof: false,
+      lookupBudgetMs: REGION_EXPORT_PROVIDER_LOOKUP_BUDGET_MS,
+      detailDongToken: ctx.detailDongToken, detailTypeToken: ctx.detailTypeToken,
+      detailTypeAliases: [], detailDirectionToken: listingContext.detailDirectionToken,
+      lineCandidateDisplays: [],
+      detailFloorKind: ctx.detailFloorKind, detailFloorBand: ctx.detailFloorBand,
+      detailFloorValue: ctx.detailFloorValue, detailTotalFloor: ctx.detailTotalFloor
+    };
+    if (isMk) {
+      lookupMsg.providerLookupKind = 'mk-uid';
+      lookupMsg.providerLookupKey = articleNo;
+      lookupMsg.listingKey = articleNo;
+      lookupMsg.providerLookupSequence = '';
+      lookupMsg.providerLookupRef = '';
+    } else {
+      if (!providerUrl) { out.reason = 'missing-provider-url'; return out; }
+      lookupMsg.providerLookupKind = 'provider-url';
+      lookupMsg.providerLookupRef = providerUrl;
+      lookupMsg.providerLookupKey = '';
+      lookupMsg.listingKey = '';
+      lookupMsg.providerLookupSequence = '';
+    }
+    const lookup = await providerResolveSendMessage(lookupMsg, 15000);
+    if (!lookup) { out.reason = 'lookup-null'; return out; }
+    if (lookup.__timeout) { out.reason = 'lookup-timeout'; return out; }
+    const lookupLoginRequired = String(lookup.directLookupStatus || '') === 'provider-login-required' || String(lookup.rejectReason || '') === 'provider-login-required';
+    // Capture-tier providers (neonet) render the 호수 in a JS SPA behind a session the SW's raw fetch
+    // can't drive — so a direct fetch legitimately hits the login wall even when the browser IS logged
+    // in. Do NOT give up here for those: fall through to the background-tab capture, which loads the
+    // page with the live session + JS. Non-capture providers keep the early login-required exit.
+    if (lookupLoginRequired && !PROVIDER_CAPTURE_TAB_FAMILIES.has(family)) {
+      out.reason = 'login-required'; out.loginRequired = true;
+      await providerResolveSendMessage({ source: BRIDGE_SOURCE, type: 'CLEAR_PROVIDER_CANDIDATE', version: VERSION, articleMarker: marker }, 8000);
+      return out;
+    }
+    const lookupStatus = String(lookup.directLookupStatus || lookup.status || '');
+    const lookupReject = String(lookup.rejectReason || '');
+    // 3) GET CANDIDATE — read whatever the SW stored for this marker.
+    let candidates = [];
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const got = await providerResolveSendMessage({ source: BRIDGE_SOURCE, type: 'GET_PROVIDER_CANDIDATE', version: VERSION, articleMarker: marker }, 15000);
+      if (got && !got.__timeout) {
+        candidates = providerCandidateResponseList(got).filter((c) => c && c.present);
+        if (candidates.length) break;
+      }
+      if (attempt < 2) await delayMs(250);
+    }
+    // 3b) TAB-CAPTURE FALLBACK — for capture-tier providers whose 호수 lives in a JS-rendered SPA that a
+    // plain fetch can't see (neonet: http rd.php?UID 302→ https offerings SPA; direct fetch returns an
+    // SPA shell with no 호). Open the offerings page in a BACKGROUND tab (active:false) via the existing
+    // capture machinery — provider-capture.js (matched on the provider host) scrapes the rendered page and
+    // reports a candidate into the SAME single-flight store — then poll GET_PROVIDER_CANDIDATE until it
+    // lands. Reuses the request already established by BEGIN_PROVIDER_REQUEST (requestKey/opener/epoch).
+    if (!candidates.length && PROVIDER_CAPTURE_TAB_FAMILIES.has(family) && providerUrl) {
+      const opened = await providerResolveSendMessage({
+        source: BRIDGE_SOURCE, type: 'OPEN_PROVIDER_BACKGROUND', version: VERSION,
+        articleMarker: marker, requestKey, providerFamily: family, providerLookupRef: providerUrl
+      }, 15000);
+      out.captureTab = opened && opened.ok
+        ? 'opened'
+        : ('open-' + (opened && opened.__timeout ? 'timeout' : (opened && opened.reason ? opened.reason : 'failed')));
+      if (opened && opened.ok) {
+        for (let attempt = 0; attempt < PROVIDER_CAPTURE_TAB_POLL_ATTEMPTS && !candidates.length; attempt += 1) {
+          await delayMs(PROVIDER_CAPTURE_TAB_POLL_INTERVAL_MS);
+          const got = await providerResolveSendMessage({ source: BRIDGE_SOURCE, type: 'GET_PROVIDER_CANDIDATE', version: VERSION, articleMarker: marker }, 15000);
+          if (got && !got.__timeout) {
+            const fresh = providerCandidateResponseList(got).filter((c) => c && c.present);
+            if (fresh.length) { candidates = fresh; out.captureTab = 'captured'; break; }
+          }
+        }
+        if (candidates.length) out.captureTab = 'captured';
+      }
+    }
+    const rawList = candidates.map((c) => normalizeText(c && (c.displayCandidate || c.display) || '')).filter(Boolean);
+    out.rawHo = rawList[0] || '';
+    if (candidates.length && capi && typeof capi.selectProviderCandidateForListingContext === 'function') {
+      const sel = capi.selectProviderCandidateForListingContext(candidates, listingContext);
+      if (sel && sel.accepted && sel.display) {
+        out.ho = normalizeText(sel.display); out.ok = true; out.proofSource = 'provider:' + family; out.reason = 'accepted';
+      } else {
+        out.reason = 'reject:' + (sel && sel.reason ? sel.reason : 'no-candidate');
+      }
+    } else if (lookupLoginRequired) {
+      // Capture-tier (neonet) fell through to the tab. Neonet's offerings are PUBLIC (verified: identical
+      // data logged-in vs logged-out) and its raw-fetch "login wall" is a false positive — euc-kr mojibake
+      // in the SW's response.text() (UTF-8) empties the observation, and the ASCII 로그인/return_url markers
+      // trip the heuristic. So do NOT treat this as a login gate: if the tab produced no exact 호, the
+      // listing simply doesn't publish one (neonet exposes 동 + floor band only). loginRequired stays false.
+      out.reason = 'no-candidate|tab-' + (out.captureTab || 'skip');
+    } else {
+      out.reason = lookupReject ? ('lookup:' + lookupReject) : (lookupStatus || 'no-candidate');
+      if (Number(lookup.redirectStatus || 0) > 0) out.reason += '|redirect' + Number(lookup.redirectStatus);
+      if (lookup.brokerOfficeBlockSeen) out.reason += '|broker-block';
+    }
+    // Clear so the single-flight store is clean for the next article.
+    await providerResolveSendMessage({ source: BRIDGE_SOURCE, type: 'CLEAR_PROVIDER_CANDIDATE', version: VERSION, articleMarker: marker }, 8000);
+    return out;
+  }
+
+  // Serialized batch resolver (single-flight store → one article fully before the next).
+  const PROVIDER_LOGIN_LABELS = { neonet: '\uBD80\uB3D9\uC0B0\uBC45\uD06C', serve: '\uBD80\uB3D9\uC0B0\uC368\uBE0C', rfine: '\uBD80\uB3D9\uC0B0\uD3EC\uC2A4', rter: '\uC54C\uD130', ten: '\uD150\uCEF4\uC988', homesdid: '\uC120\uBC29' };
+  function sendOpenProviderLogin(family) {
+    safeRuntimeSendMessage({ source: BRIDGE_SOURCE, type: 'OPEN_PROVIDER_LOGIN', version: VERSION, family: String(family || '') }, function () {});
+  }
+  function showProviderLoginPrompt(family) {
+    try {
+      const fam = String(family || '');
+      if (!fam || typeof document === 'undefined' || !document.body) return null;
+      const id = 'dhs-provider-login-prompt';
+      const existing = document.getElementById(id);
+      if (existing) existing.remove();
+      const label = PROVIDER_LOGIN_LABELS[fam] || fam;
+      const box = document.createElement('div');
+      box.id = id; box.setAttribute('data-dhs-login-family', fam);
+      box.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;background:#1f2937;color:#fff;padding:10px 12px;border-radius:8px;font:13px/1.4 -apple-system,sans-serif;box-shadow:0 4px 12px rgba(0,0,0,.3);display:flex;align-items:center;gap:10px';
+      const span = document.createElement('span');
+      span.textContent = label + ' \uB85C\uADF8\uC778 \uD544\uC694';
+      const btn = document.createElement('button');
+      btn.type = 'button'; btn.textContent = '\uB85C\uADF8\uC778\uD558\uAE30';
+      btn.style.cssText = 'background:#3b82f6;color:#fff;border:0;border-radius:6px;padding:6px 10px;cursor:pointer;font-weight:600';
+      btn.addEventListener('click', function () { sendOpenProviderLogin(fam); box.remove(); });
+      const close = document.createElement('button');
+      close.type = 'button'; close.textContent = '\u00D7';
+      close.style.cssText = 'background:transparent;color:#9ca3af;border:0;cursor:pointer;font-size:16px';
+      close.addEventListener('click', function () { box.remove(); });
+      box.appendChild(span); box.appendChild(btn); box.appendChild(close); document.body.appendChild(box);
+      return box;
+    } catch (_) { return null; }
+  }
+
+  async function resolveListingsViaProvider(items, opts) {
+    const options = opts || {};
+    const list = Array.isArray(items) ? items : [];
+    const limit = Number(options.limit || 0) || list.length;
+    const results = [];
+    for (let i = 0; i < list.length && i < limit; i += 1) {
+      const it = list[i] || {};
+      let res;
+      try { res = await resolveOneListingViaProvider(String(it.complexNo || ''), it.article); }
+      catch (err) { res = { ho: '', rawHo: '', proofSource: '', family: '', ok: false, reason: 'error:' + String(err && err.message || err) }; }
+      results.push({ item: it, result: res });
+      await delayMs(120);
+    }
+    if (!options.suppressLoginPrompt) {
+      const lr = (results.find(function (r) { return r && r.result && r.result.loginRequired; }) || {}).result;
+      if (lr && lr.family) showProviderLoginPrompt(lr.family);
+    }
+    return results;
+  }
+
   // Load the option list for the level whose parent is `parentCortarNo`. `pathLen` is how many levels
   // are already chosen (0 → 시/도 list). Guards against stale async with a monotonic token.
   function loadRegionPickerLevel(parentCortarNo, pathLen) {
@@ -2830,6 +3477,9 @@
       state.regionExportSelectionLabel = selection.label;
       state.regionExportSelectionValues = selection.values.slice(0, 3);
       state.regionExportSelectionProof = 'dhs-picker';
+      // Capture the leaf 읍/면/동 cortarNo so the API region-export pipeline can collect listings directly
+      // from Naver's regions API (the DHS selection KEY encodes cortarNames, not the cortarNo the API needs).
+      state.regionExportSelectionCortarNo = String(picked.cortarNo || '');
       state.regionExportStatus = 'confirming-region';
       renderOverlay();
       return true;
@@ -3624,6 +4274,7 @@
       groupedExactObservationCount: Math.min(9, Math.max(0, Number(input.groupedExactObservationCount || 0) || 0)),
       dongHoStatus: input.dongHoStatus || '',
       dongHo: input.dongHo || '',
+      candidateText: input.candidateText || '',
       candidateCount: Math.min(999, Number(input.candidateCount || 0) || 0),
       candidateComplete: input.candidateComplete === true
         ? true
@@ -3744,15 +4395,17 @@
   }
 
   const REGION_EXPORT_SIMPLE_HEADERS = [
+    '\uB2E8\uC9C0\uBA85',
     '\uB3D9',
     '\uD638\uC218',
+    '\uD6C4\uBCF4',
     '\uAC70\uB798\uBC29\uC2DD',
     '\uAC00\uACA9',
     '\uD0C0\uC785',
     '\uD3C9\uC218',
     '\uBC29\uD5A5',
     '\uCE35/\uC804\uB9DD',
-    '\uC785\uC8FC\uAC00\uB2A5\uC77C/\uD2B9\uC9D5',
+    '\uC785\uC8FC\uAC00\uB2A5\uC77C',
     '\uC635\uC158',
     '\uB9E4\uBB3C\uD2B9\uC9D5',
     '\uBE44\uACE0',
@@ -3852,6 +4505,14 @@
     return regionExportPresentation(row).ho;
   }
 
+  // 후보 column: when 호수 is 미확정, show the line-inference candidate 호수 list (already deduped/unioned
+  // across group members by the pipeline into row.candidateText). Blank when the 호수 is exact.
+  function regionExportCandidateCell(row) {
+    const safe = row || {};
+    if (regionExportPresentation(safe).status === 'exact') return '';
+    return normalizeText(safe.candidateText);
+  }
+
   function regionExportAreaHint(text) {
     const api = listingAreaPresentationApi();
     return api && typeof api.supplyAreaFromText === 'function' ? api.supplyAreaFromText(text) : '';
@@ -3933,6 +4594,16 @@
     if (/\uC785\uC8FC\s*\uD611\uC758|\uD611\uC758|\uB0A0\uC9DC\uD611\uC758/.test(text)) return '\uC785\uC8FC\uD611\uC758';
     if (/\uC785\uC8FC\uAC00\uB2A5/.test(text)) return '\uC785\uC8FC\uAC00\uB2A5';
     return '';
+  }
+
+  // 입주가능일 date, mirroring the CLI's formatMoveInPossibleDate: NOW → 즉시, else YMD → YY년M월D일.
+  function regionApiMoveInDate(article) {
+    const a = article || {};
+    const raw = normalizeText(a.moveInPossibleYmd);
+    if (/^NOW$/i.test(raw)) return '즉시';
+    const digits = (raw || normalizeText(a.moveInTypeName)).replace(/[^0-9]/g, '');
+    if (digits.length !== 8) return '';
+    return `${digits.slice(2, 4)}년${String(Number(digits.slice(4, 6)))}월${String(Number(digits.slice(6, 8)))}일`;
   }
 
   function regionExportOption(row) {
@@ -4205,8 +4876,10 @@
     const floorView = regionExportFloorViewFeature(safe);
     const moveFeature = regionExportMoveFeature(safe);
     return [
+      normalizeText(safe.complexName),
       regionExportDongCell(safe),
       regionExportHoCell(safe),
+      regionExportCandidateCell(safe),
       normalizeText(safe.dealType),
       normalizeText(safe.priceHint),
       normalizeText(safe.type),
@@ -4414,20 +5087,64 @@
   // Save the cleaned rows as .xlsx, ALWAYS carrying the CSV equivalent as a fallback so the SW can retry
   // as .csv if the .xlsx download fails or the xlsx writer was unavailable — the user never hits a bare
   // "저장 실패" with no file. baseName has no extension; the SW picks .xlsx or the .csv fallback name.
-  async function saveRegionExportWorkbook(baseName, grid, csvText) {
+  async function saveRegionExportWorkbook(baseName, grid, csvText, options) {
     const safeCsv = typeof csvText === 'string' ? csvText : '';
+    // overwrite/replaceDownloadId let the incremental snapshots (and the final save) target ONE file that is
+    // replaced each time instead of piling up dhs-region-… (1).xlsx, (2).xlsx, …
+    const extra = {};
+    if (options && options.overwrite) extra.overwrite = true;
+    if (options && Number(options.replaceDownloadId) > 0) extra.replaceDownloadId = Number(options.replaceDownloadId);
     let xlsxBase64 = '';
     try { xlsxBase64 = buildRegionExportXlsxBase64(grid); } catch (_) { xlsxBase64 = ''; }
     if (xlsxBase64) {
-      return downloadRegionExportWorkbook({
+      return downloadRegionExportWorkbook(Object.assign({
         filename: `${baseName}.xlsx`,
         xlsxBase64,
         csvText: safeCsv,
         filenameFallback: `${baseName}.csv`
-      });
+      }, extra));
     }
     // xlsx writer unavailable (partial/stale extension load) — save CSV rather than fail.
-    return downloadRegionExportWorkbook({ filename: `${baseName}.csv`, csvText: safeCsv });
+    return downloadRegionExportWorkbook(Object.assign({ filename: `${baseName}.csv`, csvText: safeCsv }, extra));
+  }
+
+  // Overwrite the run's single workbook with everything collected so far. Called up front (empty → header
+  // file) and after every listing. Coalesced so overlapping listings don't fire concurrent downloads.
+  async function saveRegionExportIncrementalSnapshot() {
+    if (!regionExportSaveBaseName) return;
+    if (regionExportIncrementalSaving) { regionExportIncrementalPending = true; return; }
+    regionExportIncrementalSaving = true;
+    try {
+      do {
+        regionExportIncrementalPending = false;
+        // Rate-limit the file rewrites: a big region is 200+ listings, and one chrome.downloads write per
+        // listing floods the download system (and Chrome Safe Browsing can hold rapid data:-URL writes as
+        // "미확인"). Coalesce to at most one write per REGION_EXPORT_SAVE_MIN_INTERVAL_MS while still
+        // reflecting every listing (any completions during the wait are flushed by the loop). The final
+        // save at run end is separate and never throttled.
+        const sinceLast = regionExportLastIncrementalSaveAt ? (Date.now() - regionExportLastIncrementalSaveAt) : REGION_EXPORT_SAVE_MIN_INTERVAL_MS;
+        if (sinceLast < REGION_EXPORT_SAVE_MIN_INTERVAL_MS) {
+          await delayMs(REGION_EXPORT_SAVE_MIN_INTERVAL_MS - sinceLast);
+          regionExportIncrementalPending = false;
+        }
+        regionExportLastIncrementalSaveAt = Date.now();
+        const rows = Array.isArray(regionExportInProgressRows) ? regionExportInProgressRows.slice() : [];
+        try {
+          const saved = await saveRegionExportWorkbook(
+            regionExportSaveBaseName,
+            regionExportRows2D(rows),
+            buildCurrentRegionCsv(rows),
+            { overwrite: true, replaceDownloadId: regionExportIncrementalDownloadId }
+          );
+          if (saved) {
+            if (Number(saved.downloadId) > 0) regionExportIncrementalDownloadId = Number(saved.downloadId);
+            if (saved.path) state.regionExportSavedPath = saved.path;
+          }
+        } catch (_) { /* keep running; next listing retries the save */ }
+      } while (regionExportIncrementalPending);
+    } finally {
+      regionExportIncrementalSaving = false;
+    }
   }
 
   function regionExportElapsedMilliseconds() {
@@ -4570,17 +5287,29 @@
       // option <button> nodes mid-interaction, so a click landing between mousedown and mouseup gets
       // cancelled (user has to click twice). Only rewrite when the rendered set actually changed.
       const loadingCell = state.regionPickerLoading && showOptions;
-      const optionSig = loadingCell
-        ? 'loading'
-        : levelOptions.map((option) => `${option.cortarNo}:${option.cortarName}`).join('|');
-      if (optionsNode.getAttribute('data-dhs-options-sig') !== optionSig) {
-        optionsNode.setAttribute('data-dhs-options-sig', optionSig);
-        if (loadingCell) {
-          optionsNode.innerHTML = '<div class="dhs-region-option is-loading" aria-disabled="true">\uBD88\uB7EC\uC624\uB294 \uC911\u2026</div>';
-        } else {
-          optionsNode.innerHTML = levelOptions.map((option) => {
-            return '<button type="button" class="dhs-region-option" role="option" aria-selected="false" data-dhs-action="pick-region-option" data-dhs-region-cortarno="' + escapeHtml(option.cortarNo) + '">' + escapeHtml(option.cortarName) + '</button>';
-          }).join('');
+      const pickerDepth = Array.isArray(state.regionPickerPath) ? state.regionPickerPath.length : 0;
+      // Anti-flicker: while a CHILD level loads (depth > 0, e.g. after clicking \uC2DC/\uB3C4), keep the current
+      // option buttons on screen \u2014 just dimmed + non-interactive via the container's .is-loading class \u2014
+      // instead of swapping them for a 1-row "\uBD88\uB7EC\uC624\uB294 \uC911" cell. That swap collapsed the
+      // max-height:168 box to ~1 row and then re-expanded, which read as the picker "\uB2EB\uD614\uB2E4 \uC5F4\uB838\uB2E4".
+      // The top-level (depth 0) first open has no meaningful previous list, so it still shows the cell.
+      optionsNode.classList.toggle('is-loading', loadingCell);
+      if (loadingCell && pickerDepth > 0) {
+        // Hold the previous buttons in place (no rewrite) so the box height stays put until the new list lands.
+        optionsNode.setAttribute('data-dhs-options-sig', 'holding');
+      } else {
+        const optionSig = loadingCell
+          ? 'loading'
+          : levelOptions.map((option) => `${option.cortarNo}:${option.cortarName}`).join('|');
+        if (optionsNode.getAttribute('data-dhs-options-sig') !== optionSig) {
+          optionsNode.setAttribute('data-dhs-options-sig', optionSig);
+          if (loadingCell) {
+            optionsNode.innerHTML = '<div class="dhs-region-option is-loading" aria-disabled="true">\uBD88\uB7EC\uC624\uB294 \uC911\u2026</div>';
+          } else {
+            optionsNode.innerHTML = levelOptions.map((option) => {
+              return '<button type="button" class="dhs-region-option" role="option" aria-selected="false" data-dhs-action="pick-region-option" data-dhs-region-cortarno="' + escapeHtml(option.cortarNo) + '">' + escapeHtml(option.cortarName) + '</button>';
+            }).join('');
+          }
         }
       }
     }
@@ -4624,9 +5353,6 @@
       return `\uC911\uB2E8\uB428 ${state.regionExportDoneCount || 0}\uAC74 \u00B7 ${regionExportElapsedSeconds()}\uCD08 \u00B7 \uB2E4\uC2DC \uC774\uC5B4\uC11C`;
     }
     if (state.regionExportStatus === 'cancelled') return '\uC800\uC7A5 \uCDE8\uC18C - \uB2E4\uC2DC \uC800\uC7A5';
-    if (state.regionExportStatus === 'error' && state.regionExportLastError === 'save-picker-unavailable') {
-      return '\uC800\uC7A5 \uC704\uCE58 \uC120\uD0DD \uBD88\uAC00';
-    }
     if (state.regionExportStatus === 'error') return '\uC9C0\uC5ED \uC815\uBCF4 \uCD94\uCD9C \uB2E4\uC2DC \uC2DC\uB3C4';
     return '\uC6D0\uD558\uB294 \uC9C0\uC5ED \uC815\uBCF4 \uCD94\uCD9C\uD558\uAE30';
   }
@@ -4826,7 +5552,9 @@
   function regionExportOverlayRow(row, resolution) {
     const cleaned = stripRegionExportRow(Object.assign({}, row || {}, resolution || {}));
     return Object.assign({}, cleaned, {
-      excelRows: regionExportSimpleRowsForOverlay(cleaned)
+      // Same options the single-listing 물건 조사 결과 uses (fixed column set, blank cells, live 걸린시간
+      // added by the overlay-view gate) so the region-export table renders identically to clicking one listing.
+      excelRows: regionExportSimpleRowsForOverlay(cleaned, { suppressElapsed: true, keepEmpty: true })
     });
   }
 
@@ -5286,6 +6014,24 @@
       }
       // Let the extraction's own coordinate click pass through the shield, then restore the block.
       const restoreShield = beginRegionExportShieldClickThrough();
+      // Watchdog: the trusted click goes to the SW, which drives a chrome.debugger Input event. If that SW
+      // response never comes back (the MV3 worker was torn down mid-command, the debugger detached, or a
+      // blocking page dialog stalled the command), the callback below never fires — which used to hang the
+      // ENTIRE 지역추출 forever on one listing. Time it out and fall back to a same-world click so the run
+      // keeps moving instead of freezing.
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(watchdog);
+        restoreShield();
+        resolve(value);
+      };
+      const watchdog = setTimeout(() => {
+        const clicked = fallbackRegionExportClick(target);
+        if (clicked) scheduleScan(scanReason || 'region-export-click-timeout');
+        finish(clicked);
+      }, REGION_EXPORT_TRUSTED_CLICK_TIMEOUT_MS);
       safeRuntimeSendMessage({
         source: BRIDGE_SOURCE,
         type: 'DISPATCH_PROVIDER_CLICK',
@@ -5300,19 +6046,19 @@
         // per-click re-attach flashes Chrome's debug infobar and repeatedly raises the window to the front.
         keepAttached: true
       }, (response) => {
-        restoreShield();
+        if (settled) return;
         if (expectedRunId && expectedRunId !== regionExportRunId) {
-          resolve(false);
+          finish(false);
           return;
         }
         if (response && response.ok) {
           scheduleScan(scanReason || 'region-export-trusted-click');
-          resolve(true);
+          finish(true);
           return;
         }
         const clicked = fallbackRegionExportClick(target);
         if (clicked) scheduleScan(scanReason || 'region-export-click-fallback');
-        resolve(clicked);
+        finish(clicked);
       });
     });
   }
@@ -6348,6 +7094,9 @@
       }
       state.regionExportDoneCount = outputRows.length;
       renderOverlay();
+      // Auto-save after every completed listing (overwrites the one run file). Fire-and-forget so it never
+      // stalls the loop; the coalescing guard keeps overlapping saves to a single in-flight download.
+      saveRegionExportIncrementalSnapshot();
       await delayMs(120);
     }
   }
@@ -6379,7 +7128,231 @@
     return rows.length - startedCount;
   }
 
+  // The leaf 읍/면/동 cortarNo captured when the region was picked (pickCurrentRegionOptionFromOverlay).
+  // Falls back to the current picker path's leaf so a run still finds the cortarNo if the field is missing.
+  function currentRegionExportCortarNo() {
+    const captured = String(state.regionExportSelectionCortarNo || '');
+    if (captured) return captured;
+    const path = Array.isArray(state.regionPickerPath) ? state.regionPickerPath : [];
+    const leaf = path.length ? path[path.length - 1] : null;
+    return String((leaf && leaf.cortarNo) || '');
+  }
+
+  // 추출하기 region-export pipeline (API-driven; formerly the __dhsTestFullPipeline verification hook):
+  //   collect (regions/complexes → complex articles) → dedup → group by physical unit (단지·동·면적·층·방향)
+  //   → resolve 호수 (MK-family listings via provider lookup, everything else via provider-free API line/
+  //   units inference) → merge band-over-merge duplicates that resolve to the SAME 단지+동+호 → 15-column
+  //   rows. Rows accumulate into regionExportInProgressRows so saveRegionExportIncrementalSnapshot writes a
+  //   single overwriting file, and the overlay ("물건 조사 결과") updates live via renderOverlay. No tabs are
+  //   opened for non-MK families, so the provider login prompt never fires on this path. Returns row objects.
+  async function runRegionApiExportPipeline(cortarNo, runId) {
+    const targetCortarNo = String(cortarNo || '');
+    // 1) collect + dedup
+    const r = await collectRegionListingsViaApi(targetCortarNo);
+    if (runId !== regionExportRunId) return [];
+    const deduped = dedupeRegionApiListings(r.listings);
+    const unique = deduped.unique;
+    // 1b) physical-unit grouping (cross-trade merge by 단지·동·면적·층·방향)
+    const grouped = groupRegionListingsByUnit(unique);
+    const groups = grouped.groups;
+    state.regionExportComplexTargetCount = Math.max(0, Number(r.complexCount || 0) || 0);
+    state.regionExportComplexDoneCount = Math.max(0, Number(r.complexCount || 0) || 0);
+    state.regionExportRowCount = groups.length;
+    state.regionExportDoneCount = 0;
+    state.regionExportExactCount = 0;
+    renderOverlay();
+    // family helpers
+    const inv = window.DHS_CP_INVENTORY;
+    const familyMap = (inv && inv.DIRECT_CPID_FAMILY_MAP) || {};
+    const famOf = (a) => {
+      const cp = String((a && a.cpid) || '');
+      return familyMap[cp] || familyMap[cp.toLowerCase()] || familyMap[cp.toUpperCase()] || '';
+    };
+    const bu = window.DHS_BUILDING_UNITS_RESOLVER;
+    const li = window.DHS_LINE_INFERENCE;
+    const nlm = window.DHS_NAVER_LINE_MAP;
+    const dongMapCache = new Map();
+    const unitsCache = new Map();
+    const lineMapCache = new Map();
+    const lineStatusTally = {};
+    // provider-free API resolve (buildingUnits then line inference); returns { display, source, ... }.
+    async function apiResolveDisplay(item) {
+      const complexNo = String(item.complexNo || '');
+      if (!dongMapCache.has(complexNo)) dongMapCache.set(complexNo, await fetchComplexDongMap(complexNo));
+      const dongMap = dongMapCache.get(complexNo);
+      const ctx = regionApiResolveContext(complexNo, item.article, null);
+      const dongInfo = dongMap.get(ctx.detailDongToken) || null;
+      if (dongInfo) { ctx.detailBuildNo = dongInfo.buildNo; ctx.detailDongNo = dongInfo.dongNo; ctx.detailDisplayDongToken = ctx.detailDongToken; }
+      if (dongInfo && dongInfo.buildNo && bu && typeof bu.resolveBuildingUnitsExact === 'function') {
+        if (!unitsCache.has(dongInfo.buildNo)) unitsCache.set(dongInfo.buildNo, await fetchBuildingUnitsBody(dongInfo.buildNo));
+        const body = unitsCache.get(dongInfo.buildNo);
+        if (body) { const rr = bu.resolveBuildingUnitsExact(body, ctx); if (rr && rr.present && rr.displayCandidate) return { display: rr.displayCandidate, source: 'buildingUnits' }; }
+      }
+      if (li && nlm && typeof li.buildLineInference === 'function' && typeof nlm.collectNaverLineMapRows === 'function') {
+        const dongNo = dongInfo ? dongInfo.dongNo : '';
+        const cacheKey = complexNo + '|' + dongNo;
+        if (!lineMapCache.has(cacheKey)) {
+          let rows = [];
+          const pt = await fetchComplexPyeongTypeBody(complexNo, dongNo); if (pt) rows = rows.concat(nlm.collectNaverLineMapRows(pt, ctx) || []);
+          const lp = await fetchComplexLandPriceBody(complexNo, dongNo); if (lp) rows = rows.concat(nlm.collectNaverLineMapRows(lp, ctx) || []);
+          lineMapCache.set(cacheKey, rows);
+        }
+        const lineMapRows = lineMapCache.get(cacheKey) || [];
+        if (!lineMapRows.length) { lineStatusTally['no-linemap'] = (lineStatusTally['no-linemap'] || 0) + 1; }
+        if (lineMapRows.length) {
+          const inf = li.buildLineInference({ lineMapRows, context: ctx });
+          const stk = (inf && (inf.status + ':' + (inf.reason || ''))) || 'null';
+          lineStatusTally[stk] = (lineStatusTally[stk] || 0) + 1;
+          const dongNum = (String(ctx.detailDongToken).match(/(\d{1,4})/) || [])[1] || '';
+          const cands = (inf && Array.isArray(inf.candidateDisplays)) ? inf.candidateDisplays : [];
+          if (inf && inf.status === 'single-estimated' && Number(inf.candidateCount || 0) === 1 && inf.displayCandidate) {
+            return { display: inf.displayCandidate, source: 'lineInference', candidateDisplays: cands, candidateCount: Number(inf.candidateCount || 0), targetDong: dongNum };
+          }
+          if (cands.length) return { display: '', source: 'lineInference-multi', candidateDisplays: cands, candidateCount: Number((inf && inf.candidateCount) || cands.length), targetDong: dongNum };
+        }
+      }
+      return { display: '', source: '', candidateDisplays: [], candidateCount: 0, targetDong: '' };
+    }
+    // Normalize any provider/api display into a canonical "N동 M호" (parseable by exactParts).
+    function toDongHo(raw, article) {
+      const t = normalizeText(raw);
+      const m = t.match(/(\d{1,4})\s*동\s*(\d{1,4})\s*호/);
+      if (m) return `${Number(m[1])}동 ${Number(m[2])}호`;
+      const hm = t.match(/(\d{1,4})\s*호/);
+      const dt = extractDongToken((article && article.buildingName) || '');
+      const dn = (String(dt).match(/(\d{1,4})/) || [])[1] || '';
+      if (hm && dn) return `${Number(dn)}동 ${Number(hm[1])}호`;
+      return '';
+    }
+    const collectedAt = new Date().toISOString();
+    const dhApi = dongHoPresentationApi();
+    // Build a 15-column row object for a resolved/merged group (combines multi-trade → 매매/전세 · 가격 매매 X
+    // / 전세 Y; unions 옵션/매물특징/입주일 across ALL members via regionExportUniqueParts).
+    function buildGroupRow(g) {
+      const a = g.article || {};
+      const distinctTrades = []; const seenT = new Set(); const priceParts = [];
+      for (const tr of g.trades) {
+        const nm = normalizeText(tr.tradeTypeName);
+        if (nm && !seenT.has(nm)) { seenT.add(nm); distinctTrades.push(nm); }
+        const pp = `${nm}${tr.price ? ' ' + tr.price : ''}`.trim();
+        if (pp && !priceParts.includes(pp)) priceParts.push(pp);
+      }
+      const dongTok = extractDongToken(a.buildingName || '') || normalizeText(a.buildingName);
+      const dongNum = (String(dongTok).match(/(\d{1,4})/) || [])[1] || dongTok;
+      const optionParts = []; const featureParts = []; const moveParts = [];
+      for (const m of g.members) {
+        const ma = m.article || {};
+        const memberText = normalizeText([ma.articleFeatureDesc, ma.articleSummary, ma.moveInTypeName].filter(Boolean).join(' '));
+        const tmp = { featureText: normalizeText(ma.articleFeatureDesc), floor: normalizeText(ma.floorInfo), text: memberText };
+        optionParts.push(regionExportOption(tmp));
+        featureParts.push(regionExportListingFeature(tmp));
+        const md = regionApiMoveInDate(ma); if (md) moveParts.push(md);
+        const mf = regionExportMoveFeature(tmp); if (mf) moveParts.push(mf);
+      }
+      const row = {
+        complexName: g.complexName,
+        articleNo: a.articleNo || '',
+        dong: dongNum,
+        floor: normalizeText(a.floorInfo),
+        type: extractDetailTypeToken(a.areaName || '') || normalizeText(a.areaName),
+        dealType: distinctTrades.join('/'),
+        priceHint: priceParts.join(' / '),
+        areaHint: String(a.area1 || ''),
+        directionHint: normalizeText(a.direction),
+        featureText: normalizeText(a.articleFeatureDesc),
+        optionText: regionExportUniqueParts(optionParts).join(' / '),
+        listingFeatureText: regionExportUniqueParts(featureParts).join(' / '),
+        moveInText: regionExportUniqueParts(moveParts).join(' / '),
+        text: normalizeText([a.articleFeatureDesc, a.articleSummary].filter(Boolean).join(' ')),
+        collectedAt
+      };
+      row._memberCount = g.members.length;
+      if (g._resolvedDisplay) { row.dongHoStatus = 'exact'; row.dongHo = g._resolvedDisplay; }
+      else {
+        row.dongHoStatus = 'unresolved'; row.dongHo = REGION_EXPORT_UNRESOLVED_LABEL;
+        if (Array.isArray(g._candidateDisplays) && g._candidateDisplays.length && dhApi && typeof dhApi.buildCandidateDisplay === 'function') {
+          const disp = dhApi.buildCandidateDisplay({ candidateDisplays: g._candidateDisplays, targetDong: g._candTargetDong || dongNum });
+          row.candidateText = normalizeText(disp).replace(/^후보\s*:\s*/, '');
+        }
+      }
+      return row;
+    }
+    // 2+3+4 fused so rows accumulate incrementally: resolve each group's 호수, merge groups that resolve to
+    // the SAME 단지+동+호 (band over-merge repair — recompute the retained row from the combined members),
+    // and build/refresh the 15-col row live.
+    const rowObjs = [];
+    const mergedByKey = new Map(); // complexNo|display → { row, group }
+    for (const g of groups) {
+      if (runId !== regionExportRunId) return rowObjs;
+      g._resolvedDisplay = ''; g._resolveSource = '';
+      const mkMember = g.members.find((it) => famOf(it.article) === 'mk');
+      if (mkMember) {
+        let res;
+        try { res = await resolveOneListingViaProvider(String(mkMember.complexNo || ''), mkMember.article); }
+        catch (e) { res = { ho: '', ok: false, reason: 'error' }; }
+        if (res && res.ok && res.ho) {
+          const dh = toDongHo(res.ho, mkMember.article);
+          if (dh) { g._resolvedDisplay = dh; g._resolveSource = res.proofSource || 'provider:mk'; }
+        }
+        await delayMs(120);
+        if (runId !== regionExportRunId) return rowObjs;
+      }
+      if (!g._resolvedDisplay) {
+        // Line-inference per member (caches make members after the first pure CPU). Take the first accepted
+        // single display; otherwise union candidate 호수 across ALL members for the 후보 column.
+        const candUnion = [];
+        let firstDisp = null;
+        for (const m of g.members) {
+          let ar; try { ar = await apiResolveDisplay(m); } catch (e) { ar = { display: '' }; }
+          if (runId !== regionExportRunId) return rowObjs;
+          if (!ar) continue;
+          if (!firstDisp && ar.display) firstDisp = ar;
+          if (Array.isArray(ar.candidateDisplays) && ar.candidateDisplays.length) candUnion.push.apply(candUnion, ar.candidateDisplays);
+          if (ar.targetDong && !g._candTargetDong) g._candTargetDong = ar.targetDong;
+        }
+        if (firstDisp && firstDisp.display) {
+          const dh = toDongHo(firstDisp.display, g.article);
+          if (dh) { g._resolvedDisplay = dh; g._resolveSource = firstDisp.source; }
+        }
+        if (!g._resolvedDisplay && candUnion.length) g._candidateDisplays = candUnion;
+      }
+      if (g._resolvedDisplay) {
+        const key = String(g.complexNo) + '|' + g._resolvedDisplay;
+        const existing = mergedByKey.get(key);
+        if (existing) {
+          existing.group.trades = existing.group.trades.concat(g.trades);
+          existing.group.members = existing.group.members.concat(g.members);
+          Object.assign(existing.row, buildGroupRow(existing.group));
+          state.regionExportCurrentRow = regionExportOverlayRow(existing.row);
+        } else {
+          const row = buildGroupRow(g);
+          rowObjs.push(row);
+          mergedByKey.set(key, { row, group: g });
+          state.regionExportCurrentRow = regionExportOverlayRow(row);
+        }
+      } else {
+        const row = buildGroupRow(g);
+        rowObjs.push(row);
+        state.regionExportCurrentRow = regionExportOverlayRow(row);
+      }
+      state.regionExportDoneCount = Math.min(9999, Number(state.regionExportDoneCount || 0) + 1);
+      state.regionExportExactCount = rowObjs.filter((row) => row.dongHoStatus === 'exact' && row.dongHo).length;
+      state.regionExportRowCount = Math.max(rowObjs.length, groups.length);
+      regionExportInProgressRows = rowObjs;
+      renderOverlay();
+      saveRegionExportIncrementalSnapshot();
+    }
+    regionExportInProgressRows = rowObjs;
+    return rowObjs;
+  }
+
   async function exportCurrentRegionRowsWithResolvers(runId, resumeInput) {
+    // 추출하기 now produces rows via the API pipeline (collect→dedup→group→resolve→15-col). The confirmed
+    // region's leaf cortarNo drives collection directly, so the legacy click→navigate→resolve DOM walk below
+    // is retained only for reference/rollback and is never reached (see runRegionApiExportPipeline).
+    const apiRowObjs = await runRegionApiExportPipeline(currentRegionExportCortarNo(), runId);
+    return apiRowObjs.map(stripRegionExportRow);
+    // ── legacy click→navigate→resolve region-export path (inert; kept for reference/rollback) ──────────
     const resume = resumeInput && typeof resumeInput === 'object' ? resumeInput : {};
     const expectedSelectionKey = state.regionExportSelectionKey;
     const rows = [];
@@ -6577,6 +7550,10 @@
     const runId = regionExportRunId + 1;
     regionExportRunId = runId;
     const baseName = `dhs-region-${currentTimestampForFilename()}`;
+    // Arm incremental auto-save for this run (one file, overwritten after each listing).
+    regionExportSaveBaseName = baseName;
+    regionExportIncrementalDownloadId = 0;
+    regionExportIncrementalPending = false;
     state.lastEvent = 'region-export';
     state.regionExportStatus = 'preparing';
     state.regionExportRowCount = 0;
@@ -6669,6 +7646,11 @@
     state.regionExportStatus = 'running';
     state.regionExportStartedAt = Date.now();
     renderOverlay();
+    // Create the run's file immediately (header-only) so 저장이 추출 시작과 동시에 시작됩니다. The resolver
+    // repoints regionExportInProgressRows at its live array next; reset here so the first write isn't a
+    // previous run's rows.
+    regionExportInProgressRows = [];
+    saveRegionExportIncrementalSnapshot();
     let rows = [];
     try {
       rows = await exportCurrentRegionRowsWithResolvers(runId, {
@@ -6761,8 +7743,10 @@
     }
     if (!beginRegionExportFileWrite(runId)) return;
     try {
-      const download = await saveRegionExportWorkbook(baseName, regionExportRows2D(rows), buildCurrentRegionCsv(rows));
+      // Final save overwrites the SAME incremental file so the run leaves exactly one complete workbook.
+      const download = await saveRegionExportWorkbook(baseName, regionExportRows2D(rows), buildCurrentRegionCsv(rows), { overwrite: true, replaceDownloadId: regionExportIncrementalDownloadId });
       if (runId !== regionExportRunId) return;
+      if (Number(download && download.downloadId) > 0) regionExportIncrementalDownloadId = Number(download.downloadId);
       const checkpointCleared = await clearRegionExportCheckpoint(regionKey);
       if (runId !== regionExportRunId) return;
       if (!checkpointCleared) throw new Error('checkpoint-cleanup-failed');
@@ -6949,6 +7933,17 @@
   function updateRegionExportShield() {
     const active = regionExportShieldActive();
     if (active) markRegionExportHeartbeat();
+    // Signal the MAIN-world page hook to suppress page-initiated popups (window.open / target=_blank) while
+    // an unattended 지역추출 runs. Those popups open a NEW ACTIVE tab, which raises + focuses the Chrome
+    // window and steals OS focus from whatever the user is working on. The provider capture the popups fed
+    // is redirected to a BACKGROUND tab instead, so 동/호수 resolution is preserved without the focus theft.
+    try {
+      const root = document.documentElement;
+      if (root) {
+        if (active) { if (root.getAttribute('data-dhs-suppress-popups') !== '1') root.setAttribute('data-dhs-suppress-popups', '1'); }
+        else if (root.hasAttribute('data-dhs-suppress-popups')) root.removeAttribute('data-dhs-suppress-popups');
+      }
+    } catch (_e) {}
     const shield = active ? ensureRegionExportShield() : document.getElementById(REGION_EXPORT_SHIELD_ID);
     if (!shield) return;
     if (!active) {
@@ -12449,6 +13444,16 @@
   pageMessageListener = (event) => safeBridgeTask(() => {
     if (!isTrustedWindowMessage(event)) return;
     const data = event.data || {};
+    // A page popup (window.open / target=_blank) was suppressed during 지역추출 to avoid stealing OS focus.
+    // Re-open its URL as a BACKGROUND tab so the provider-capture content script can still read it (동/호수)
+    // without raising the Chrome window. Only honored while an export is actually shielded.
+    if (data.source === PAGE_SOURCE && data.type === 'DHS_SUPPRESSED_POPUP') {
+      const url = String(data.url || '');
+      if (url && /^https?:\/\//i.test(url) && regionExportShieldActive()) {
+        safeRuntimeSendMessage({ source: BRIDGE_SOURCE, type: 'OPEN_BACKGROUND_TAB', version: VERSION, url });
+      }
+      return;
+    }
     if (data.source === 'DHS_CDP_TARGET_CONTEXT' && data.context && typeof data.context === 'object') {
       applyCdpTargetContext(data.context);
       scheduleScan('cdp-target-context');
@@ -12462,6 +13467,14 @@
       return;
     }
     if (data.source !== PAGE_SOURCE || data.type !== PAGE_EVENT) return;
+
+    // The MAIN-world hook forwards the captured Naver Bearer token so the API-driven region collector can
+    // authenticate /api/articles/complex calls from the isolated world (which can't auto-inject it).
+    if (data.eventName === 'naver-auth-header') {
+      const auth = String(data.authHeader || '');
+      if (/^Bearer\s+/i.test(auth)) naverApiAuthHeader = auth;
+      return;
+    }
 
     const eventName = sanitizeEventName(data.eventName);
     const endpointCategory = sanitizeEndpointCategory(data.endpointCategory);

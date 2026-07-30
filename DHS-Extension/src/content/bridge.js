@@ -7850,23 +7850,13 @@
       renderOverlay();
       return;
     }
+    // Quality gate is NON-BLOCKING for the API pipeline: exact 호수 is data-limited (~32-37% — only 매경
+    // exposes the unit number in Naver's ecosystem), so a low confirmed ratio is EXPECTED, not a failure.
+    // We ALWAYS save the collected data (미확정 rows are marked as such and carry 후보 candidates); the
+    // confirmation ratio is surfaced as an informational note, never a block that throws the data away.
     const quality = regionExportQualityGate(rows);
     if (!quality.ok) {
-      state.regionExportLastError = quality.message;
-      state.regionExportCurrentRow = null;
-      if (!beginRegionExportFileWrite(runId)) return;
-      let finalStatus = 'quality-blocked';
-      try {
-        await saveRegionExportWorkbook(baseName, regionExportStatusRows2D('quality-blocked', quality.message), buildRegionExportStatusCsv('quality-blocked', quality.message));
-      } catch (error) {
-        finalStatus = 'error';
-        state.regionExportLastError = String(error && error.message || error || '').slice(0, 120);
-      }
-      if (runId !== regionExportRunId) return;
-      state.regionExportStatus = finalStatus;
-      finishRegionExportTiming();
-      renderOverlay();
-      return;
+      state.regionExportQualityNote = quality.message;
     }
     if (!beginRegionExportFileWrite(runId)) return;
     try {

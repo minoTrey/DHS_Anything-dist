@@ -686,6 +686,13 @@
   let regionExportIncrementalSaving = false;
   let regionExportIncrementalPending = false;
   let regionExportLastIncrementalSaveAt = 0;
+  // File System Access API handle for the run's single output file. Acquired ONCE up front (while the
+  // 추출하기 click still carries transient user activation) via window.showSaveFilePicker; every later
+  // save writes to it SILENTLY (handle.createWritable → write → close) so the user is prompted exactly
+  // once at the start instead of on every incremental chrome.downloads write. Null → fall back to a
+  // single chrome.downloads save at run end (see saveRegionExportWorkbook / saveRegionExportIncrementalSnapshot).
+  let regionExportFileHandle = null;
+  let regionExportFileHandleName = '';
   let regionExportRunId = 0;
   let regionExportMarkerNoncePromise = null;
   let regionExportResumeRegionKey = '';
@@ -5021,6 +5028,73 @@
     return writer.buildXlsx(grid, { sheetName: '동호수 정리' }).base64;
   }
 
+  function regionExportBase64ToUint8Array(base64) {
+    const clean = String(base64 || '');
+    if (!clean || typeof atob !== 'function' || typeof Uint8Array === 'undefined') return null;
+    const binary = atob(clean);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  // Prompt ONCE (window.showSaveFilePicker) for the run's output file while the 추출하기 click still holds
+  // transient user activation. Store the returned handle so every incremental + final save writes to it
+  // silently. Returns false (→ chrome.downloads fallback) when the API is unavailable, blocked, or the
+  // user cancels the picker. Never throws.
+  async function acquireRegionExportFileHandle() {
+    regionExportFileHandle = null;
+    regionExportFileHandleName = '';
+    if (typeof window === 'undefined' || typeof window.showSaveFilePicker !== 'function') return false;
+    const suggestedName = `dhs-region-${currentTimestampForFilename()}.xlsx`;
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName,
+        types: [{
+          description: 'Excel',
+          accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] }
+        }]
+      });
+      if (!handle || typeof handle.createWritable !== 'function') return false;
+      regionExportFileHandle = handle;
+      regionExportFileHandleName = String((handle && handle.name) || suggestedName);
+      return true;
+    } catch (_) {
+      // AbortError (user cancelled), SecurityError (blocked in this context), etc. → one-shot fallback.
+      regionExportFileHandle = null;
+      regionExportFileHandleName = '';
+      return false;
+    }
+  }
+
+  // Silent overwrite of the run's chosen file with the current grid. Returns true on success; on failure
+  // drops the handle (so callers fall back to a one-shot download) and returns false. Never leaves a
+  // writable open.
+  async function writeRegionExportToFileHandle(grid) {
+    const handle = regionExportFileHandle;
+    if (!handle || typeof handle.createWritable !== 'function') return false;
+    const base64 = buildRegionExportXlsxBase64(grid);
+    const bytes = base64 ? regionExportBase64ToUint8Array(base64) : null;
+    if (!bytes) return false;
+    let writable = null;
+    try {
+      const blob = typeof Blob !== 'undefined'
+        ? new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+        : bytes;
+      writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      writable = null;
+      return true;
+    } catch (_) {
+      if (writable) { try { await writable.abort(); } catch (__) {} }
+      // Handle became unusable (permission revoked, disk error). Drop it so the run finishes with a
+      // single chrome.downloads save instead of retrying a dead handle every listing.
+      regionExportFileHandle = null;
+      regionExportFileHandleName = '';
+      return false;
+    }
+  }
+
   function regionExportRowHasDongHoEvidence(row) {
     const safe = row || {};
     if (safe.listingContextContractVersion >= 1 && safe.listingContextMatched !== true) return false;
@@ -5088,6 +5162,15 @@
   // as .csv if the .xlsx download fails or the xlsx writer was unavailable — the user never hits a bare
   // "저장 실패" with no file. baseName has no extension; the SW picks .xlsx or the .csv fallback name.
   async function saveRegionExportWorkbook(baseName, grid, csvText, options) {
+    // File System Access mode: write silently to the run's chosen handle (one prompt at run start only,
+    // never per-listing). Only fall through to chrome.downloads if the handle write fails (which also
+    // drops the handle so later saves don't re-prompt).
+    if (regionExportFileHandle) {
+      const wrote = await writeRegionExportToFileHandle(grid);
+      if (wrote) {
+        return { downloadId: 0, path: regionExportFileHandleName || `${baseName}.xlsx` };
+      }
+    }
     const safeCsv = typeof csvText === 'string' ? csvText : '';
     // overwrite/replaceDownloadId let the incremental snapshots (and the final save) target ONE file that is
     // replaced each time instead of piling up dhs-region-… (1).xlsx, (2).xlsx, …
@@ -5112,6 +5195,12 @@
   // file) and after every listing. Coalesced so overlapping listings don't fire concurrent downloads.
   async function saveRegionExportIncrementalSnapshot() {
     if (!regionExportSaveBaseName) return;
+    // Fallback mode (no File System Access handle for this run): do NOT save per-listing. A per-listing
+    // chrome.downloads.download fires a fresh download every listing → Chrome's repeated "여러 파일을
+    // 다운로드하려고 합니다 / 계속 저장?" prompt (the reported bug). Only the SILENT handle path saves
+    // incrementally; without it the run saves exactly ONCE at the end (final saveRegionExportWorkbook),
+    // so at most one prompt. Overlay progress (renderOverlay) is independent and keeps updating.
+    if (!regionExportFileHandle) return;
     if (regionExportIncrementalSaving) { regionExportIncrementalPending = true; return; }
     regionExportIncrementalSaving = true;
     try {
@@ -7491,6 +7580,12 @@
         && state.regionExportLastError === 'user-cancelled'
         ? regionExportResumeRegionKey
         : '';
+      // Prompt for the output file NOW — this runs synchronously inside the 추출하기 click's call stack, so
+      // transient user activation is still valid for window.showSaveFilePicker. Doing it here (before the
+      // lock wait / region restore / ~40s collection) is the ONLY point activation is guaranteed present.
+      // If it's unavailable or the user cancels, regionExportFileHandle stays null → single-download
+      // fallback at run end (no repeated per-listing prompts).
+      await acquireRegionExportFileHandle();
       state.regionExportStatus = 'preparing';
       state.regionExportLastError = '';
       state.regionExportSelectionKey = confirmedSelection.key;

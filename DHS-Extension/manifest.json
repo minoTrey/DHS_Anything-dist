@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DHS Anything",
-  "version": "0.1.332",
+  "version": "0.1.333",
   "description": "Redacted diagnostics for Naver Real Estate listing context.",
   "permissions": [
     "alarms",

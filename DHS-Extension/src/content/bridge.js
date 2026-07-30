@@ -2819,6 +2819,15 @@
     return resp.json();
   }
 
+  // /api/articles/complex requires the Naver Bearer captured from the page's own traffic (forwarded by the
+  // MAIN-world hook as naver-auth-header). The isolated-world fetch above can't mint it, so if it hasn't
+  // arrived yet EVERY article call 401s and the region looks empty (0 listings). Wait briefly for it.
+  async function ensureNaverApiAuthReady(timeoutMs) {
+    const deadline = Date.now() + (Math.max(0, Number(timeoutMs) || 0));
+    while (!naverApiAuthHeader && Date.now() < deadline) { await delayMs(150); }
+    return Boolean(naverApiAuthHeader);
+  }
+
   async function fetchRegionComplexesViaApi(cortarNo) {
     const j = await fetchNaverApiJson(
       '/api/regions/complexes?cortarNo=' + encodeURIComponent(cortarNo)
@@ -2854,20 +2863,32 @@
   // Collect every article across every complex in the 동 via API. Returns raw articles; dedup + 호수
   // resolution + row shaping happen in later phases.
   async function collectRegionListingsViaApi(cortarNo, runId) {
-    const complexes = await fetchRegionComplexesViaApi(cortarNo);
+    const targetCortarNo = String(cortarNo || '');
+    // Guard: an empty/blank cortarNo makes /api/regions/complexes return an error body (no complexList) ->
+    // silently 0 complexes -> a confusing empty "no-rows" export. Fail loudly with a clear reason instead.
+    if (!targetCortarNo) throw new Error('region-export-cortar-missing');
+    // Ensure the article API auth is present before collecting so complexes don't all 401 into 0 listings.
+    await ensureNaverApiAuthReady(4000);
+    const complexes = await fetchRegionComplexesViaApi(targetCortarNo);
     const listings = [];
+    let authFailures = 0;
     for (const complex of complexes) {
       if (runId && runId !== regionExportRunId) break;
       const complexNo = String(complex && complex.complexNo || '');
       if (!complexNo) continue;
       let articles = [];
-      try { articles = await fetchComplexArticlesViaApi(complexNo); } catch (_) { articles = []; }
+      try {
+        articles = await fetchComplexArticlesViaApi(complexNo);
+      } catch (error) {
+        if (/naver-api-http-401|naver-api-http-403/.test(String(error && error.message || ''))) authFailures += 1;
+        articles = [];
+      }
       for (const article of articles) {
         listings.push({ complexNo, complexName: String(complex.complexName || ''), article });
       }
       await delayMs(60);
     }
-    return { complexCount: complexes.length, listings };
+    return { complexCount: complexes.length, listings, authFailures };
   }
 
   // ── Phase 2: dedup + 동일매물 collapse (ported from CLI regionScanDuplicateKey) ──────────────────────
@@ -5166,10 +5187,16 @@
     // never per-listing). Only fall through to chrome.downloads if the handle write fails (which also
     // drops the handle so later saves don't re-prompt).
     if (regionExportFileHandle) {
-      const wrote = await writeRegionExportToFileHandle(grid);
-      if (wrote) {
-        return { downloadId: 0, path: regionExportFileHandleName || `${baseName}.xlsx` };
-      }
+      const handleName = regionExportFileHandleName || `${baseName}.xlsx`;
+      let wrote = await writeRegionExportToFileHandle(grid);
+      // writeRegionExportToFileHandle drops the handle on failure; retry once if it survived a transient error.
+      if (!wrote && regionExportFileHandle) wrote = await writeRegionExportToFileHandle(grid);
+      // A handle was chosen for THIS run: ALL saves (incremental + final) go through the silent handle write
+      // and NEVER through chrome.downloads. A chrome.downloads data:-URL .xlsx write is what Chrome Safe
+      // Browsing holds as "\uC800\uC7A5 \uBCF4\uB958/\uBBF8\uD655\uC778", so we must not emit one while a handle exists -
+      // even if the write failed. Earlier incremental handle writes already put the run's data on disk, so
+      // report the handle path instead of falling through to a data:-URL download.
+      return { downloadId: 0, path: handleName, handleWriteFailed: !wrote };
     }
     const safeCsv = typeof csvText === 'string' ? csvText : '';
     // overwrite/replaceDownloadId let the incremental snapshots (and the final save) target ONE file that is
@@ -7237,8 +7264,13 @@
   async function runRegionApiExportPipeline(cortarNo, runId) {
     const targetCortarNo = String(cortarNo || '');
     // 1) collect + dedup
-    const r = await collectRegionListingsViaApi(targetCortarNo);
+    const r = await collectRegionListingsViaApi(targetCortarNo, runId);
     if (runId !== regionExportRunId) return [];
+    // Complexes were found but EVERY article fetch 401/403'd -> the Naver auth token never arrived. Surface
+    // a clear reason rather than silently producing an empty ("no-rows") export.
+    if (Number(r.complexCount || 0) > 0 && r.listings.length === 0 && Number(r.authFailures || 0) >= Number(r.complexCount || 0)) {
+      throw new Error('region-export-auth-missing');
+    }
     const deduped = dedupeRegionApiListings(r.listings);
     const unique = deduped.unique;
     // 1b) physical-unit grouping (cross-trade merge by 단지·동·면적·층·방향)

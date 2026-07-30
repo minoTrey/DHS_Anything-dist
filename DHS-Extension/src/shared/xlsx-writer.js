@@ -50,18 +50,78 @@
     return name;
   }
 
+  // Auto-fit column widths from content. CJK glyphs are ~1.8x wide, so weight them; clamp to a readable band.
+  function colWidthsFromRows(rows, colCount) {
+    const w = new Array(colCount).fill(6);
+    (Array.isArray(rows) ? rows : []).forEach((row) => {
+      (Array.isArray(row) ? row : []).forEach((v, c) => {
+        if (c >= colCount) return;
+        const s = String(v == null ? '' : v);
+        let len = 0;
+        for (let i = 0; i < s.length; i += 1) len += (s.charCodeAt(i) > 0x2E7F ? 1.8 : 1.05);
+        if (len + 2.5 > w[c]) w[c] = len + 2.5;
+      });
+    });
+    return w.map((x) => Math.min(46, Math.max(6, Math.round(x * 10) / 10)));
+  }
+
+  // Styled worksheet: frozen header row, per-column auto width, header row uses style 1 (bold/filled/centered),
+  // body cells use style 2 (bordered, left+middle, wrap), plus an auto-filter over the whole table.
   function sheetXml(rows) {
-    const rowXml = rows.map((row, rowIndex) => {
+    const safeRows = Array.isArray(rows) ? rows : [];
+    const colCount = safeRows.reduce((m, r) => Math.max(m, Array.isArray(r) ? r.length : 0), 1);
+    const widths = colWidthsFromRows(safeRows, colCount);
+    const cols = '<cols>' + widths.map((width, i) =>
+      `<col min="${i + 1}" max="${i + 1}" width="${width}" customWidth="1"/>`).join('') + '</cols>';
+    const rowXml = safeRows.map((row, rowIndex) => {
+      const isHeader = rowIndex === 0;
+      const style = isHeader ? 1 : 2;
       const cells = (Array.isArray(row) ? row : []).map((value, colIndex) => {
         const ref = `${columnName(colIndex)}${rowIndex + 1}`;
-        return `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${escapeXml(value)}</t></is></c>`;
+        return `<c r="${ref}" s="${style}" t="inlineStr"><is><t xml:space="preserve">${escapeXml(value)}</t></is></c>`;
       }).join('');
-      return `<row r="${rowIndex + 1}">${cells}</row>`;
+      const ht = isHeader ? ' ht="26" customHeight="1"' : '';
+      return `<row r="${rowIndex + 1}"${ht}>${cells}</row>`;
     }).join('');
+    const lastCol = columnName(Math.max(0, colCount - 1));
+    const nRows = safeRows.length || 1;
+    const views = '<sheetViews><sheetView workbookViewId="0">'
+      + '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+      + '<selection pane="bottomLeft" activeCell="A2" sqref="A2"/></sheetView></sheetViews>';
+    const fmt = '<sheetFormatPr defaultRowHeight="18"/>';
+    const filter = safeRows.length > 1 ? `<autoFilter ref="A1:${lastCol}${nRows}"/>` : '';
     return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
       + '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-      + `<sheetData>${rowXml}</sheetData></worksheet>`;
+      + views + fmt + cols
+      + `<sheetData>${rowXml}</sheetData>${filter}</worksheet>`;
   }
+
+  const STYLES = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    + '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+    + '<fonts count="2">'
+    + '<font><sz val="10"/><name val="맑은 고딕"/></font>'
+    + '<font><b/><sz val="10"/><color rgb="FFFFFFFF"/><name val="맑은 고딕"/></font>'
+    + '</fonts>'
+    + '<fills count="3">'
+    + '<fill><patternFill patternType="none"/></fill>'
+    + '<fill><patternFill patternType="gray125"/></fill>'
+    + '<fill><patternFill patternType="solid"><fgColor rgb="FF305496"/><bgColor indexed="64"/></patternFill></fill>'
+    + '</fills>'
+    + '<borders count="2">'
+    + '<border><left/><right/><top/><bottom/><diagonal/></border>'
+    + '<border>'
+    + '<left style="thin"><color rgb="FFD9D9D9"/></left><right style="thin"><color rgb="FFD9D9D9"/></right>'
+    + '<top style="thin"><color rgb="FFD9D9D9"/></top><bottom style="thin"><color rgb="FFD9D9D9"/></bottom><diagonal/>'
+    + '</border>'
+    + '</borders>'
+    + '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+    + '<cellXfs count="3">'
+    + '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+    + '<xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>'
+    + '<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
+    + '</cellXfs>'
+    + '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+    + '</styleSheet>';
 
   const CONTENT_TYPES = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
@@ -69,6 +129,7 @@
     + '<Default Extension="xml" ContentType="application/xml"/>'
     + '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
     + '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+    + '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
     + '</Types>';
 
   const ROOT_RELS = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -79,6 +140,7 @@
   const WORKBOOK_RELS = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
     + '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+    + '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
     + '</Relationships>';
 
   function workbookXml(sheetName) {
@@ -161,6 +223,7 @@
       { name: '_rels/.rels', bytes: utf8Bytes(ROOT_RELS) },
       { name: 'xl/workbook.xml', bytes: utf8Bytes(workbookXml(opts.sheetName)) },
       { name: 'xl/_rels/workbook.xml.rels', bytes: utf8Bytes(WORKBOOK_RELS) },
+      { name: 'xl/styles.xml', bytes: utf8Bytes(STYLES) },
       { name: 'xl/worksheets/sheet1.xml', bytes: utf8Bytes(sheetXml(safeRows)) }
     ];
     const bytes = zipStored(entries);
